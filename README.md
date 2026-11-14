@@ -98,6 +98,42 @@ Examples:
 
 ---
 
+### ⚙️ Install the requirements and run the script
+
+```bash
+# Install required applications
+sudo apt-get install bash git ghostscript coreutils util-linux findutils grep sed gawk psmisc openssh-client ca-certificates python3 python3-pip python3-venv python3-lxml python3-psutil iputils-ping xvfb nodejs -y
+
+# Clone the repository
+git clone --depth 1 https://github.com/PrajwalKoirala638/agilent-com-documentation
+
+# Enter the folder
+cd agilent-com-documentation
+
+# Create a virtual environment
+python3 -m venv .venv
+
+# Activate the virtual environment
+source .venv/bin/activate
+
+# Install the Python packages required by the project.
+pip install -r requirements.txt
+
+# Install the required Python packages
+pip install playwright
+
+# Install Playwright system dependencies
+playwright install --with-deps
+
+# Install Playwright Chromium
+playwright install chromium
+
+# Run the script
+python3 download_sds.py
+```
+
+---
+
 ## 📄 What's Inside the `PDFs/` Folder
 
 Every file in the **`PDFs/`** folder is a document published on or linked from the official Agilent website. Typical document types include:
