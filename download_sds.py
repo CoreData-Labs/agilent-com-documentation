@@ -599,6 +599,7 @@ def start_normal_chromium_process(
         "--no-default-browser-check",  # Do not ask to become the default browser
         "--disable-dev-shm-usage",  # Use disk instead of the small shared memory in containers, which prevents crashes
         "--window-size=1400,1000",  # Use a large window so the page lays out normally
+        "--no-sandbox",
     ]  # End of the command line
     if (
         hasattr(os, "geteuid") and os.geteuid() == 0
