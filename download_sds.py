@@ -156,6 +156,7 @@ CHROMIUM_DEBUGGING_PORT = 0  # Port Playwright uses to talk to Chromium (0 = Chr
 CHROMIUM_STARTUP_TIMEOUT_IN_SECONDS = (
     60  # How long to wait for Chromium to be ready after starting it
 )
+CHROMIUM_DISABLE_SANDBOX_IF_NEEDED = True  # Start again with --no-sandbox when this system does not allow Chromium's sandbox
 
 # ============================================================== 3. PATTERNS AND CONSTANTS
 PDF_OR_SDS_LINK_PATTERN = re.compile(  # Matches links that look like PDFs or safety data sheets
@@ -620,6 +621,12 @@ def forward_chromium_output_to_log(
         logger.debug(
             "CHROMIUM OUTPUT: %s", output_line.rstrip()
         )  # Write the line to the log
+        chromium_process.recent_output_lines.append(
+            output_line.rstrip()
+        )  # Keep the line for later checks
+        del chromium_process.recent_output_lines[
+            :-200
+        ]  # Keep only the latest 200 lines
 
 
 def read_debugging_endpoint_from_profile() -> Optional[
@@ -644,8 +651,8 @@ def read_debugging_endpoint_from_profile() -> Optional[
 
 
 def start_normal_chromium_process(
-    chromium_executable_path: str,
-) -> subprocess.Popen:  # Start Chromium the same way you would start it yourself
+    chromium_executable_path: str, use_no_sandbox: bool = False
+) -> subprocess.Popen:  # Start Chromium
     chromium_command = [  # The command line used to start Chromium
         chromium_executable_path,  # The Chromium program itself
         f"--remote-debugging-port={CHROMIUM_DEBUGGING_PORT}",  # Allow Playwright to connect to this Chromium
@@ -656,13 +663,21 @@ def start_normal_chromium_process(
         "--disable-dev-shm-usage",  # Use disk instead of the small shared memory in containers, which prevents crashes
         "--window-size=1400,1000",  # Use a large window so the page lays out normally
     ]  # End of the command line
-    if (
+    running_as_root = (
         hasattr(os, "geteuid") and os.geteuid() == 0
-    ):  # Linux refuses to run Chromium as root without this switch
+    )  # Linux refuses to run Chromium as root with its sandbox
+    if running_as_root:  # Chromium needs --no-sandbox when it runs as root
         logger.warning(
             "Running as root, adding --no-sandbox because Chromium requires it"
         )  # Tell the user
-        chromium_command.append("--no-sandbox")  # Allow Chromium to start as root
+    if running_as_root or use_no_sandbox:  # The sandbox must be switched off
+        if (
+            use_no_sandbox and not running_as_root
+        ):  # The reason is not root, but a system that blocks the sandbox
+            logger.warning(
+                "Starting Chromium WITHOUT its security sandbox (--no-sandbox) because this system blocks it"
+            )  # Warn
+        chromium_command.append("--no-sandbox")  # Switch the sandbox off
     if (
         sys.platform.startswith("linux")
         and not os.environ.get("DISPLAY")
@@ -694,13 +709,32 @@ def start_normal_chromium_process(
         errors="replace",  # Never fail on strange characters
         bufsize=1,  # Deliver the output line by line
     )  # End of the start call
-    threading.Thread(  # Copy Chromium's messages into our log in the background
-        target=forward_chromium_output_to_log,  # The function that does the copying
-        args=(chromium_process,),  # The process to read from
-        name="chromium-output",  # A name that shows up in debugging tools
-        daemon=True,  # Do not keep the script alive because of this thread
-    ).start()  # Start the thread
+    chromium_process.recent_output_lines = (
+        []
+    )  # Keeps Chromium's messages so we can look for known problems
+    chromium_process.output_thread = (
+        threading.Thread(  # Copy Chromium's messages into our log in the background
+            target=forward_chromium_output_to_log,  # The function that does the copying
+            args=(chromium_process,),  # The process to read from
+            name="chromium-output",  # A name that shows up in debugging tools
+            daemon=True,  # Do not keep the script alive because of this thread
+        )
+    )  # End of the thread definition
+    chromium_process.output_thread.start()  # Start the thread
     return chromium_process  # Give the running process back to the caller
+
+
+def chromium_failed_because_of_sandbox(
+    chromium_process: subprocess.Popen,
+) -> bool:  # Did Chromium stop over its sandbox?
+    chromium_process.output_thread.join(
+        timeout=3
+    )  # Give the output thread a moment to read the last messages
+    return any(  # Look through everything Chromium printed
+        "no usable sandbox"
+        in output_line.lower()  # The message Chromium prints when its sandbox cannot start
+        for output_line in chromium_process.recent_output_lines  # Check each saved line
+    )  # End of the search
 
 
 def wait_for_chromium_debugging_endpoint(
@@ -1774,6 +1808,7 @@ class BrowserSession:  # Owns Chromium and both tabs, and can restart them if Ch
         internet_monitor: InternetMonitor,
     ) -> None:  # Setup
         self.internet_monitor = internet_monitor  # Tells us whether the internet works
+        self.use_no_sandbox = False  # Becomes True once we learn that this system blocks Chromium's sandbox
         self.download_page = (
             None  # The temporary download tab, only set while it is open
         )
@@ -1791,11 +1826,36 @@ class BrowserSession:  # Owns Chromium and both tabs, and can restart them if Ch
 
     def start(self) -> None:  # Start Chromium and open both tabs
         self.chromium_process = start_normal_chromium_process(
-            self.chromium_executable_path
-        )  # Start it as a normal window
+            self.chromium_executable_path, self.use_no_sandbox
+        )  # Start it
         debugging_endpoint = wait_for_chromium_debugging_endpoint(
             self.chromium_process
         )  # Wait until Chromium is ready
+        if debugging_endpoint is None and chromium_failed_because_of_sandbox(
+            self.chromium_process
+        ):  # The sandbox is the problem
+            if (
+                not CHROMIUM_DISABLE_SANDBOX_IF_NEEDED
+            ):  # The user does not allow starting without the sandbox
+                stop_chromium_process(
+                    self.chromium_process
+                )  # Make sure nothing is left running
+                raise RuntimeError(
+                    "Chromium cannot use its sandbox here. Set CHROMIUM_DISABLE_SANDBOX_IF_NEEDED = True or allow user namespaces"
+                )  # Stop
+            logger.warning(
+                "Chromium cannot use its sandbox on this system, starting it again with --no-sandbox"
+            )  # Explain
+            stop_chromium_process(
+                self.chromium_process
+            )  # Make sure the failed process is gone
+            self.use_no_sandbox = True  # Remember this choice for every later start
+            self.chromium_process = start_normal_chromium_process(
+                self.chromium_executable_path, True
+            )  # Start it again
+            debugging_endpoint = wait_for_chromium_debugging_endpoint(
+                self.chromium_process
+            )  # Wait until it is ready
         if debugging_endpoint is None:  # Chromium did not become ready
             stop_chromium_process(
                 self.chromium_process
