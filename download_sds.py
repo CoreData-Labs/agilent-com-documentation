@@ -51,7 +51,6 @@ import subprocess  # Starts the Chromium program as a normal process
 import sys  # Gives access to the console output stream
 import threading  # Runs the internet check in the background
 import time  # Provides sleep() and the current time
-import urllib.request  # Used to check whether Chromium is ready to accept a connection
 from contextlib import contextmanager  # Lets a method be used inside a "with" block
 from pathlib import Path  # Object-oriented file system paths
 from typing import (
@@ -153,11 +152,9 @@ TCP_FALLBACK_TIMEOUT_IN_SECONDS = 2  # How long to wait for that connection test
 
 # ---- Chromium settings
 WEBRTC_IP_HANDLING_POLICY = "default_public_interface_only"  # Hides local IPs from WebRTC (or "disable_non_proxied_udp")
-CHROMIUM_DEBUGGING_PORT = (
-    9222  # Local port Playwright uses to talk to the running Chromium
-)
+CHROMIUM_DEBUGGING_PORT = 0  # Port Playwright uses to talk to Chromium (0 = Chromium picks a free port by itself)
 CHROMIUM_STARTUP_TIMEOUT_IN_SECONDS = (
-    30  # How long to wait for Chromium to be ready after starting it
+    60  # How long to wait for Chromium to be ready after starting it
 )
 
 # ============================================================== 3. PATTERNS AND CONSTANTS
@@ -587,6 +584,65 @@ def find_chromium_executable_path(
     return chromium_executable_path  # Use this Chromium
 
 
+def allow_local_connections_without_proxy() -> None:  # Make sure a proxy setting cannot break the link to Chromium
+    local_addresses = [
+        "127.0.0.1",
+        "localhost",
+        "::1",
+    ]  # Addresses that must never go through a proxy
+    for variable_name in (
+        "NO_PROXY",
+        "no_proxy",
+    ):  # Both spellings are used by different programs
+        existing_value = os.environ.get(variable_name, "")  # Read the current value
+        existing_entries = [
+            entry.strip() for entry in existing_value.split(",") if entry.strip()
+        ]  # Split it into entries
+        for local_address in local_addresses:  # Check each local address
+            if (
+                local_address not in existing_entries
+            ):  # The address is missing from the list
+                existing_entries.append(local_address)  # Add it
+        os.environ[variable_name] = ",".join(existing_entries)  # Save the new value
+    logger.debug(
+        "NO_PROXY is now: %s", os.environ["NO_PROXY"]
+    )  # Record the final value
+
+
+def forward_chromium_output_to_log(
+    chromium_process: subprocess.Popen,
+) -> None:  # Copy Chromium's own messages into our log
+    if chromium_process.stdout is None:  # Check whether Chromium's output is available
+        return  # Nothing to copy
+    for (
+        output_line
+    ) in chromium_process.stdout:  # Read Chromium's output line by line until it closes
+        logger.debug(
+            "CHROMIUM OUTPUT: %s", output_line.rstrip()
+        )  # Write the line to the log
+
+
+def read_debugging_endpoint_from_profile() -> Optional[
+    str
+]:  # Read the address Chromium publishes when it is ready
+    active_port_file_path = (
+        CHROMIUM_PROFILE_FOLDER / "DevToolsActivePort"
+    )  # File Chromium writes once it is listening
+    if not active_port_file_path.exists():  # Chromium has not written it yet
+        return None  # Not ready
+    try:  # Reading can fail while Chromium is still writing
+        file_lines = active_port_file_path.read_text(
+            encoding="utf-8"
+        ).splitlines()  # Read the file line by line
+    except OSError:  # The file could not be read right now
+        return None  # Try again later
+    if (
+        len(file_lines) < 2 or not file_lines[0].strip().isdigit()
+    ):  # The file is incomplete
+        return None  # Try again later
+    return f"ws://127.0.0.1:{int(file_lines[0].strip())}{file_lines[1].strip()}"  # Line 1 is the port, line 2 the path
+
+
 def start_normal_chromium_process(
     chromium_executable_path: str,
 ) -> subprocess.Popen:  # Start Chromium the same way you would start it yourself
@@ -599,7 +655,6 @@ def start_normal_chromium_process(
         "--no-default-browser-check",  # Do not ask to become the default browser
         "--disable-dev-shm-usage",  # Use disk instead of the small shared memory in containers, which prevents crashes
         "--window-size=1400,1000",  # Use a large window so the page lays out normally
-        "--no-sandbox",
     ]  # End of the command line
     if (
         hasattr(os, "geteuid") and os.geteuid() == 0
@@ -608,44 +663,90 @@ def start_normal_chromium_process(
             "Running as root, adding --no-sandbox because Chromium requires it"
         )  # Tell the user
         chromium_command.append("--no-sandbox")  # Allow Chromium to start as root
+    if (
+        sys.platform.startswith("linux")
+        and not os.environ.get("DISPLAY")
+        and not os.environ.get("WAYLAND_DISPLAY")
+    ):  # No screen
+        logger.warning(
+            "No display found (DISPLAY and WAYLAND_DISPLAY are not set), Chromium cannot open a window"
+        )  # Warn
+    else:  # A display seems to be available
+        logger.debug(
+            "Display settings: DISPLAY=%s WAYLAND_DISPLAY=%s",
+            os.environ.get("DISPLAY"),
+            os.environ.get("WAYLAND_DISPLAY"),
+        )  # Record
+    CHROMIUM_PROFILE_FOLDER.mkdir(
+        parents=True, exist_ok=True
+    )  # Make sure the profile folder exists
+    (CHROMIUM_PROFILE_FOLDER / "DevToolsActivePort").unlink(
+        missing_ok=True
+    )  # Remove the old file so we never read stale data
     logger.info(
         "Starting Chromium: %s", " ".join(chromium_command)
     )  # Record the exact command
-    chromium_process = subprocess.Popen(
-        chromium_command
-    )  # Start Chromium as a separate normal process
+    chromium_process = subprocess.Popen(  # Start Chromium as a separate normal process
+        chromium_command,  # The command line
+        stdout=subprocess.PIPE,  # Capture Chromium's normal output
+        stderr=subprocess.STDOUT,  # Capture Chromium's error output in the same stream
+        text=True,  # Read the output as text
+        errors="replace",  # Never fail on strange characters
+        bufsize=1,  # Deliver the output line by line
+    )  # End of the start call
+    threading.Thread(  # Copy Chromium's messages into our log in the background
+        target=forward_chromium_output_to_log,  # The function that does the copying
+        args=(chromium_process,),  # The process to read from
+        name="chromium-output",  # A name that shows up in debugging tools
+        daemon=True,  # Do not keep the script alive because of this thread
+    ).start()  # Start the thread
     return chromium_process  # Give the running process back to the caller
 
 
-def wait_for_chromium_debugging_port(
+def wait_for_chromium_debugging_endpoint(
     chromium_process: subprocess.Popen,
-) -> bool:  # Wait until Chromium is ready
-    debugging_address = f"http://127.0.0.1:{CHROMIUM_DEBUGGING_PORT}/json/version"  # Page Chromium serves when ready
+) -> Optional[str]:  # Wait until Chromium is ready
+    started_timestamp = time.time()  # Moment when we started waiting
     deadline_timestamp = (
-        time.time() + CHROMIUM_STARTUP_TIMEOUT_IN_SECONDS
+        started_timestamp + CHROMIUM_STARTUP_TIMEOUT_IN_SECONDS
     )  # Moment when we give up waiting
+    next_report_timestamp = (
+        started_timestamp + 5
+    )  # Moment of the next "still waiting" message
     while time.time() < deadline_timestamp:  # Keep checking until the deadline passes
         if (
             chromium_process.poll() is not None
         ):  # Check whether Chromium closed by itself
             logger.error(
-                "Chromium exited early with code %s", chromium_process.returncode
-            )  # Record the problem
-            return False  # Chromium is not running
-        try:  # The connection fails until Chromium is ready
-            with urllib.request.urlopen(
-                debugging_address, timeout=2
-            ) as debugging_response:  # Ask Chromium
-                logger.info(
-                    "Chromium is ready (HTTP %s)", debugging_response.status
-                )  # Record that it is ready
-                return True  # Chromium is ready
-        except OSError:  # Chromium is not accepting connections yet
-            time.sleep(0.5)  # Wait a moment and ask again
+                "Chromium exited early with code %s, see the CHROMIUM OUTPUT lines above",
+                chromium_process.returncode,
+            )  # Say
+            return None  # Chromium is not running
+        debugging_endpoint = (
+            read_debugging_endpoint_from_profile()
+        )  # Look for the address Chromium publishes
+        if debugging_endpoint is not None:  # Chromium is ready
+            logger.info(
+                "Chromium is ready after %.1f seconds: %s",
+                time.time() - started_timestamp,
+                debugging_endpoint,
+            )  # Record
+            return debugging_endpoint  # Hand the address back
+        if time.time() >= next_report_timestamp:  # Time for a progress message
+            logger.info(
+                "Still waiting for Chromium to start (%.0f seconds so far, the process is running)",
+                time.time() - started_timestamp,
+            )  # Say
+            next_report_timestamp += 5  # Schedule the next message
+        time.sleep(0.5)  # Wait a moment and look again
     logger.error(
-        "Chromium was not ready after %d seconds", CHROMIUM_STARTUP_TIMEOUT_IN_SECONDS
-    )  # Record the timeout
-    return False  # Chromium never became ready
+        "Chromium was not ready after %d seconds, but its process is still running",
+        CHROMIUM_STARTUP_TIMEOUT_IN_SECONDS,
+    )  # Say
+    logger.error(
+        "Check the CHROMIUM OUTPUT lines above for the reason. Common causes: no display, a damaged profile folder, or a very slow disk"
+    )  # Hint
+    return None  # Chromium never became ready
 
 
 def stop_chromium_process(
@@ -1692,19 +1793,20 @@ class BrowserSession:  # Owns Chromium and both tabs, and can restart them if Ch
         self.chromium_process = start_normal_chromium_process(
             self.chromium_executable_path
         )  # Start it as a normal window
-        if not wait_for_chromium_debugging_port(
+        debugging_endpoint = wait_for_chromium_debugging_endpoint(
             self.chromium_process
-        ):  # Wait until Chromium is ready for Playwright
+        )  # Wait until Chromium is ready
+        if debugging_endpoint is None:  # Chromium did not become ready
+            stop_chromium_process(
+                self.chromium_process
+            )  # Do not leave a stuck Chromium behind
             raise RuntimeError(
-                "Chromium did not become ready in time"
-            )  # Stop with a clear message
-        logger.info(
-            "Connecting Playwright to the running Chromium on port %d",
-            CHROMIUM_DEBUGGING_PORT,
-        )  # Record it
-        self.connected_browser = self.playwright_instance.chromium.connect_over_cdp(  # Attach to the running Chromium
-            f"http://127.0.0.1:{CHROMIUM_DEBUGGING_PORT}"  # Local address Chromium is listening on
-        )  # End of the connect call
+                "Chromium did not become ready, read the CHROMIUM OUTPUT lines above for the reason"
+            )  # Stop
+        logger.info("Connecting Playwright to the running Chromium")  # Record it
+        self.connected_browser = self.playwright_instance.chromium.connect_over_cdp(
+            debugging_endpoint
+        )  # Attach directly
         browser_context = self.connected_browser.contexts[
             0
         ]  # Use Chromium's normal browsing context
@@ -1958,6 +2060,7 @@ def run_downloader() -> None:  # Run the whole job from start to finish
         database_connection
     )  # Skip old pending URLs that are not USA English
     prepare_chromium_profile_preferences()  # Make Chromium download PDFs instead of previewing them
+    allow_local_connections_without_proxy()  # Never send the local Chromium connection through a proxy
     run_statistics = {  # Running totals for the whole run
         "downloaded": 0,  # Files saved
         "skipped": 0,  # URLs skipped because the file already exists
