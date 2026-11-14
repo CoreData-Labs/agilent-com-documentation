@@ -4,15 +4,21 @@
 # How it works:
 #   1. Starts your installed Chromium as a normal window and attaches Playwright to it.
 #   2. Visits the Agilent home page briefly, then searches the keywords a-z and 0-9.
-#   3. After every result page it downloads the PDFs found there right away (in a second tab).
+#   3. After every result page it downloads the PDFs found there right away. The second tab used for
+#      downloading is opened only when something needs downloading, and closed again afterwards.
 #   4. A SQLite database remembers every URL and file name, so nothing is downloaded twice.
 #   5. If Chromium crashes or closes, it is restarted and the work continues where it stopped.
 #   6. Pages that say "The page may be temporarily unavailable or may no longer exist" are skipped.
 #   7. Random pauses, back-off waits and a stop-after-repeated-blocks rule keep the traffic gentle.
-#   8. Everything that happens is logged to the console.
+#   8. A background check pings 1.1.1.1 and 8.8.8.8. If neither answers, Chromium is closed and only
+#      started again (and scraping resumed) once the internet is back.
+#   9. Only USA English files are downloaded (file names ending in _NAEnglish.pdf).
+#  10. Tabs: only the results tab stays open; the download tab exists only while downloading, and any
+#      other tab or popup is closed at once.
+#  11. Everything that happens is logged to the console.
 #
-# Setup: pip install playwright && playwright install chromium
-# Run: python download_sds.py
+# Setup: pip install playwright   and then   playwright install chromium
+# Run:   python download_sds.py
 #
 # File layout:
 #   1. Imports
@@ -27,8 +33,9 @@
 #  10. Page actions
 #  11. Downloading
 #  12. Scraping
-#  13. Browser session and restarts
-#  14. Main program
+#  13. Internet monitor
+#  14. Browser session and restarts
+#  15. Main program
 
 # ============================================================== 1. IMPORTS
 import json  # Reads and writes the Chromium preferences file
@@ -36,14 +43,21 @@ import logging  # Prints detailed log lines to the console
 import os  # Reads environment variables and checks whether files exist
 import random  # Creates random pause lengths
 import re  # Regular expressions for link matching and text cleaning
+import shutil  # Finds programs such as ping on the system PATH
+import socket  # Opens a plain network connection when ping is not available
 import sqlite3  # Built-in SQLite database used to remember what was already downloaded
 import string  # Provides the lowercase letters and digits used as search keywords
 import subprocess  # Starts the Chromium program as a normal process
 import sys  # Gives access to the console output stream
+import threading  # Runs the internet check in the background
 import time  # Provides sleep() and the current time
 import urllib.request  # Used to check whether Chromium is ready to accept a connection
+from contextlib import contextmanager  # Lets a method be used inside a "with" block
 from pathlib import Path  # Object-oriented file system paths
-from typing import Optional  # Type hint for values that may be None
+from typing import (
+    Iterator,
+    Optional,
+)  # Type hints for generators and for values that may be None
 from urllib.parse import unquote, urlparse  # Helpers to read a file name out of a URL
 
 from playwright.sync_api import (
@@ -78,6 +92,7 @@ HOME_PAGE_URL = (
 HOME_PAGE_WARM_UP_SECONDS = (
     3  # How long to stay on the home page before scraping starts
 )
+REQUIRED_FILE_NAME_ENDING = "_NAEnglish.pdf"  # Only files whose name ends like this (USA English) are downloaded
 
 # ---- Folders and files
 DOWNLOAD_FOLDER = Path(
@@ -125,6 +140,16 @@ MAXIMUM_CONSECUTIVE_BLOCKS = 5  # Stop the whole run after this many blocks in a
 MAXIMUM_BROWSER_RESTARTS = (
     5  # How many times Chromium may be restarted after closing or crashing
 )
+
+# ---- Internet check
+INTERNET_CHECK_HOSTS = (
+    "1.1.1.1",
+    "8.8.8.8",
+)  # Addresses that are pinged to find out whether the internet works
+INTERNET_CHECK_INTERVAL_IN_SECONDS = 10  # How often the background check runs
+PING_TIMEOUT_IN_SECONDS = 5  # How long to wait for one ping answer
+TCP_FALLBACK_PORT = 53  # Port used for a plain connection test when ping is missing or blocked (DNS port)
+TCP_FALLBACK_TIMEOUT_IN_SECONDS = 2  # How long to wait for that connection test
 
 # ---- Chromium settings
 WEBRTC_IP_HANDLING_POLICY = "default_public_interface_only"  # Hides local IPs from WebRTC (or "disable_non_proxied_udp")
@@ -190,6 +215,12 @@ logger = logging.getLogger(
 class AccessBlockedError(
     Exception
 ):  # Raised when the website keeps blocking us and we should stop
+    pass  # No extra behaviour is needed
+
+
+class InternetOutageError(
+    Exception
+):  # Raised when the internet is down and Chromium must wait for it
     pass  # No extra behaviour is needed
 
 
@@ -395,6 +426,27 @@ def mark_url_as_processed(
     )  # Record the database change
 
 
+def ignore_non_usa_english_urls(
+    database_connection: sqlite3.Connection,
+) -> None:  # Drop old pending URLs we no longer want
+    ignored_count = 0  # Counts how many pending URLs are ignored
+    for pending_url in load_unprocessed_urls(
+        database_connection
+    ):  # Look at every URL that is still pending
+        if not is_usa_english_pdf_url(
+            pending_url
+        ):  # Check whether it is NOT a USA English file
+            mark_url_as_processed(
+                database_connection, pending_url
+            )  # Mark it as done so it is never downloaded
+            ignored_count += 1  # Count it
+    logger.info(
+        "Ignored %d pending URL(s) that do not end in %s",
+        ignored_count,
+        REQUIRED_FILE_NAME_ENDING,
+    )  # Report
+
+
 def is_file_name_already_downloaded(
     database_connection: sqlite3.Connection, file_name: str
 ) -> bool:  # Name check
@@ -433,6 +485,17 @@ def guess_file_name_from_url(
     ):  # Only trust names that really end in .pdf
         return last_path_segment  # Give the guessed name back
     return None  # The URL does not reveal the real file name, so do not guess
+
+
+def is_usa_english_pdf_url(
+    source_url: str,
+) -> bool:  # Check whether a URL points to a USA English file
+    url_path = unquote(
+        urlparse(source_url).path
+    )  # Take the path part of the URL, without the ?query
+    return url_path.lower().endswith(
+        REQUIRED_FILE_NAME_ENDING.lower()
+    )  # True when the name ends in _NAEnglish.pdf
 
 
 def build_safe_file_name(
@@ -800,7 +863,18 @@ def extract_pdf_urls_from_page(
             "&amp;", "&"
         )  # Decode escaped ampersands
         found_urls.add(cleaned_url)  # Keep the cleaned URL
-    return found_urls  # Give all URLs from this page back
+    usa_english_urls = {
+        found_url for found_url in found_urls if is_usa_english_pdf_url(found_url)
+    }  # Keep USA English only
+    ignored_url_count = len(found_urls) - len(
+        usa_english_urls
+    )  # Count the links that are ignored
+    logger.debug(
+        "Ignored %d link(s) that do not end in %s",
+        ignored_url_count,
+        REQUIRED_FILE_NAME_ENDING,
+    )  # Record it
+    return usa_english_urls  # Give only the USA English URLs back
 
 
 def click_next_page_button(
@@ -1027,11 +1101,33 @@ def start_chromium_download(
         )  # Stop listening for downloads
 
 
+def is_url_already_downloaded_by_name(
+    database_connection: sqlite3.Connection, source_url: str
+) -> bool:  # Name check
+    guessed_file_name = guess_file_name_from_url(
+        source_url
+    )  # Predict the name when the URL shows it
+    if guessed_file_name is None:  # The URL does not reveal a trustworthy file name
+        return False  # We cannot tell, so assume it still needs downloading
+    guessed_safe_file_name = build_safe_file_name(
+        guessed_file_name
+    )  # Apply the naming rules
+    return (  # The file counts as downloaded when it is known in either place
+        is_file_name_already_downloaded(
+            database_connection, guessed_safe_file_name
+        )  # Known in the database
+        or (
+            DOWNLOAD_FOLDER / guessed_safe_file_name
+        ).exists()  # Or already present on disk
+    )  # End of the check
+
+
 def download_pdf_urls(  # Download a list of PDF URLs, one after the other
     download_page: Page,  # Tab used only for downloading
     database_connection: sqlite3.Connection,  # Database that tracks URLs and files
     pdf_urls: list,  # The URLs to download now
     run_statistics: dict,  # Running totals that this function updates
+    internet_monitor: "InternetMonitor",  # Tells us whether the internet works
 ) -> None:  # Nothing is returned, the totals are updated in place
     if not pdf_urls:  # Check whether there is anything to do
         logger.debug("No PDF URLs to download in this batch")  # Record it
@@ -1046,31 +1142,18 @@ def download_pdf_urls(  # Download a list of PDF URLs, one after the other
         logger.info(
             "(%d/%d) Processing %s", url_position, len(pdf_urls), source_url
         )  # Record the progress
-        guessed_file_name = guess_file_name_from_url(
-            source_url
-        )  # Predict the name when the URL shows it
-        if (
-            guessed_file_name is not None
-        ):  # Only check when the URL gave us a trustworthy name
-            guessed_safe_file_name = build_safe_file_name(
-                guessed_file_name
-            )  # Apply the naming rules
-            if (  # Skip the download when the predicted file already exists
-                is_file_name_already_downloaded(
-                    database_connection, guessed_safe_file_name
-                )  # Known in database
-                or (
-                    DOWNLOAD_FOLDER / guessed_safe_file_name
-                ).exists()  # Or already present on disk
-            ):  # End of the skip condition
-                logger.info(
-                    "  SKIP: %s already exists", guessed_safe_file_name
-                )  # Explain the skip
-                mark_url_as_processed(
-                    database_connection, source_url
-                )  # Remember this URL is finished
-                run_statistics["skipped"] += 1  # Count the skip
-                continue  # Move on to the next URL
+        internet_monitor.raise_if_internet_is_down()  # Stop here and wait if the internet is down
+        if is_url_already_downloaded_by_name(
+            database_connection, source_url
+        ):  # Skip when the predicted file exists
+            logger.info(
+                "  SKIP: the file for this URL already exists"
+            )  # Explain the skip
+            mark_url_as_processed(
+                database_connection, source_url
+            )  # Remember this URL is finished
+            run_statistics["skipped"] += 1  # Count the skip
+            continue  # Move on to the next URL
 
         if has_made_a_request:  # Only pause between two real requests
             pause_like_a_person(
@@ -1087,6 +1170,12 @@ def download_pdf_urls(  # Download a list of PDF URLs, one after the other
                 download_error
             ):  # Check whether Chromium itself has closed
                 raise  # Let the restart logic deal with it, this URL stays pending
+            if (
+                internet_monitor.confirm_internet_is_down()
+            ):  # Check whether the internet being down caused the error
+                raise InternetOutageError(
+                    "The internet went down while downloading"
+                )  # Wait for it, this URL stays pending
             logger.error(
                 "  FAILED to open %s: %s",
                 source_url,
@@ -1135,6 +1224,12 @@ def download_pdf_urls(  # Download a list of PDF URLs, one after the other
             )  # The website answered normally, so the blocks-in-a-row count restarts
             continue  # Move on to the next URL
         if chromium_download is None:  # Chromium never produced a download
+            if (
+                internet_monitor.confirm_internet_is_down()
+            ):  # Check whether the internet being down is the reason
+                raise InternetOutageError(
+                    "The internet went down while downloading"
+                )  # Wait for it, this URL stays pending
             logger.error(
                 "  FAILED: no download (%s) for %s", download_outcome, source_url
             )  # Record the failure
@@ -1219,14 +1314,51 @@ def download_pdf_urls(  # Download a list of PDF URLs, one after the other
     )  # Show the totals after this batch
 
 
+def download_pdf_urls_in_temporary_tab(  # Download URLs, opening the second tab only if it is really needed
+    browser_session: "BrowserSession",  # Owns the tabs and can open the temporary download tab
+    database_connection: sqlite3.Connection,  # Database that tracks URLs and files
+    pdf_urls: list,  # The URLs that might need downloading
+    run_statistics: dict,  # Running totals that this function updates
+) -> None:  # Nothing is returned, the totals are updated in place
+    urls_needing_download = []  # Collects the URLs whose files are really missing
+    for source_url in pdf_urls:  # Check each URL before opening any tab
+        if is_url_already_downloaded_by_name(
+            database_connection, source_url
+        ):  # The file already exists
+            logger.info(
+                "  SKIP: the file for %s already exists", source_url
+            )  # Explain the skip
+            mark_url_as_processed(
+                database_connection, source_url
+            )  # Remember this URL is finished
+            run_statistics["skipped"] += 1  # Count the skip
+        else:  # The file is missing
+            urls_needing_download.append(source_url)  # Keep the URL for downloading
+    if not urls_needing_download:  # Check whether anything is left to download
+        logger.info(
+            "Nothing to download in this batch, so no second tab is opened"
+        )  # Record the decision
+        return  # Leave without opening a tab
+    browser_session.internet_monitor.raise_if_internet_is_down()  # Do not open a tab while the internet is down
+    with browser_session.temporary_download_tab() as download_page:  # Open the second tab and close it afterwards
+        download_pdf_urls(  # Download the missing files
+            download_page,
+            database_connection,
+            urls_needing_download,
+            run_statistics,
+            browser_session.internet_monitor,  # Args
+        )  # End of the call
+
+
 # ============================================================== 12. SCRAPING
 def collect_and_download_pdf_urls_for_keyword(  # Scrape one keyword and download each page's PDFs right away
-    page: Page,  # Tab used for browsing the search results
-    download_page: Page,  # Second tab used only for downloading
+    browser_session: "BrowserSession",  # Owns the results tab and opens the download tab when needed
     database_connection: sqlite3.Connection,  # Database that tracks URLs and files
     search_keyword: str,  # Keyword to search for
     run_statistics: dict,  # Running totals of downloaded, skipped and failed files
 ) -> set:  # Returns every URL found for this keyword
+    page = browser_session.results_page  # The tab used for browsing the search results
+    browser_session.internet_monitor.raise_if_internet_is_down()  # Wait for the internet before opening the search page
     search_url = SEARCH_URL_TEMPLATE.format(
         search_keyword=search_keyword
     )  # Build the search address
@@ -1236,6 +1368,13 @@ def collect_and_download_pdf_urls_for_keyword(  # Scrape one keyword and downloa
     page_status = open_page_politely(
         page, search_url, run_statistics
     )  # Open the page, backing off if blocked
+    if (
+        page_status == PAGE_STATUS_FAILED
+        and browser_session.internet_monitor.confirm_internet_is_down()
+    ):  # No internet?
+        raise InternetOutageError(
+            "The internet went down while opening the search page"
+        )  # Wait for it, then retry
     if page_status != PAGE_STATUS_OPENED:  # Check whether the page opened normally
         logger.warning(
             "[%s] skipping this keyword (page status: %s)", search_keyword, page_status
@@ -1249,6 +1388,8 @@ def collect_and_download_pdf_urls_for_keyword(  # Scrape one keyword and downloa
     for result_page_number in range(
         1, MAXIMUM_RESULT_PAGES_PER_KEYWORD + 1
     ):  # Walk through the result pages
+        browser_session.close_unneeded_tabs()  # Close any tab other than the results tab
+        browser_session.internet_monitor.raise_if_internet_is_down()  # Stop here and wait if the internet is down
         page.bring_to_front()  # Keep the results tab in front so the browser does not slow it down
         scroll_to_bottom_of_page(page)  # Make sure all results on this page are loaded
         urls_on_this_page = extract_pdf_urls_from_page(
@@ -1283,9 +1424,12 @@ def collect_and_download_pdf_urls_for_keyword(  # Scrape one keyword and downloa
                 result_page_number,
                 len(urls_to_download_now),
             )  # Say
-            download_pdf_urls(
-                download_page, database_connection, urls_to_download_now, run_statistics
-            )  # Download now
+            download_pdf_urls_in_temporary_tab(
+                browser_session,
+                database_connection,
+                urls_to_download_now,
+                run_statistics,
+            )  # Now
         if (
             result_page_number > 1 and not new_urls_on_this_page
         ):  # Check whether paging gave us nothing new
@@ -1313,7 +1457,202 @@ def collect_and_download_pdf_urls_for_keyword(  # Scrape one keyword and downloa
     return all_urls_for_keyword  # Give back every URL found for this keyword
 
 
-# ============================================================== 13. BROWSER SESSION AND RESTARTS
+# ============================================================== 13. INTERNET MONITOR
+def is_host_responding(
+    host_address: str,
+) -> bool:  # Check whether one address answers us
+    if shutil.which("ping") is not None:  # Check whether the ping program is installed
+        if sys.platform.startswith("win"):  # Windows uses different ping options
+            ping_command = [
+                "ping",
+                "-n",
+                "1",
+                "-w",
+                str(PING_TIMEOUT_IN_SECONDS * 1000),
+                host_address,
+            ]  # One ping, time in ms
+        elif sys.platform.startswith(
+            "linux"
+        ):  # Linux uses -W for the timeout in seconds
+            ping_command = [
+                "ping",
+                "-c",
+                "1",
+                "-W",
+                str(PING_TIMEOUT_IN_SECONDS),
+                host_address,
+            ]  # One ping
+        else:  # macOS and other systems
+            ping_command = [
+                "ping",
+                "-c",
+                "1",
+                host_address,
+            ]  # One ping, the time limit is enforced below
+        try:  # Running ping can fail or take too long
+            ping_result = subprocess.run(  # Run the ping program
+                ping_command,  # The command to run
+                stdout=subprocess.DEVNULL,  # Hide the normal output
+                stderr=subprocess.DEVNULL,  # Hide the error output
+                timeout=PING_TIMEOUT_IN_SECONDS + 2,  # Never wait longer than this
+            )  # End of the run call
+            if ping_result.returncode == 0:  # Exit code 0 means the host answered
+                return True  # The host responded
+        except (
+            subprocess.TimeoutExpired,
+            OSError,
+        ) as ping_error:  # Ping took too long or could not run
+            logger.debug(
+                "Ping to %s failed to run: %s", host_address, ping_error
+            )  # Record it
+    else:  # The ping program is not installed
+        logger.debug(
+            "The ping program is not installed, using a plain network connection instead"
+        )  # Record it
+    try:  # Some networks block ping, so also try a plain connection
+        with socket.create_connection(
+            (host_address, TCP_FALLBACK_PORT), timeout=TCP_FALLBACK_TIMEOUT_IN_SECONDS
+        ):  # Connect
+            return True  # The connection worked, so the host responded
+    except OSError:  # The connection did not work
+        return False  # The host did not respond
+
+
+def check_internet_connection() -> bool:  # The internet works when at least one of the addresses answers
+    for host_address in INTERNET_CHECK_HOSTS:  # Try each address in turn
+        if is_host_responding(host_address):  # Check whether this address answers
+            logger.debug("Internet check: %s responded", host_address)  # Record it
+            return True  # One answer is enough
+        logger.debug("Internet check: %s did not respond", host_address)  # Record it
+    return False  # Neither address answered
+
+
+class InternetMonitor:  # Checks the internet in a background thread and closes Chromium when it goes down
+    def __init__(self) -> None:  # Prepare the shared state
+        self.internet_available = threading.Event()  # Set while the internet works
+        self.stop_requested = threading.Event()  # Set when the monitor should stop
+        self.state_lock = (
+            threading.Lock()
+        )  # Prevents two threads from changing the state at the same time
+        self.outage_close_function = (
+            None  # Function that closes Chromium when the internet goes down
+        )
+        self.outage_occurred = (
+            False  # True when Chromium was closed because of an outage
+        )
+        self.monitor_thread = None  # The background thread
+
+    def start(
+        self, outage_close_function
+    ) -> None:  # Do a first check and start the background thread
+        self.outage_close_function = (
+            outage_close_function  # Remember how to close Chromium
+        )
+        if check_internet_connection():  # First check, done right now
+            self.internet_available.set()  # The internet works
+            logger.info("Internet check: the internet is working")  # Record it
+        else:  # No answer from either address
+            logger.warning(
+                "Internet check: no answer from %s, waiting for the internet",
+                " or ".join(INTERNET_CHECK_HOSTS),
+            )  # Say
+        self.monitor_thread = threading.Thread(
+            target=self.monitor_loop, name="internet-monitor", daemon=True
+        )  # Create it
+        self.monitor_thread.start()  # Start checking in the background
+
+    def stop(self) -> None:  # Stop the background thread
+        self.stop_requested.set()  # Ask the thread to finish
+        if self.monitor_thread is not None:  # Check whether it was started
+            self.monitor_thread.join(timeout=15)  # Wait a little for it to finish
+
+    def monitor_loop(self) -> None:  # The work done by the background thread
+        while not self.stop_requested.is_set():  # Keep going until we are told to stop
+            self.update_state(
+                check_internet_connection()
+            )  # Check the internet and react to any change
+            self.stop_requested.wait(
+                INTERNET_CHECK_INTERVAL_IN_SECONDS
+            )  # Sleep, but wake up early when stopping
+
+    def update_state(
+        self, internet_works: bool
+    ) -> None:  # React when the internet goes down or comes back
+        should_close_chromium = (
+            False  # Becomes True when the internet has just gone down
+        )
+        with self.state_lock:  # Only one thread may change the state at a time
+            was_available = (
+                self.internet_available.is_set()
+            )  # What we believed until now
+            if internet_works and not was_available:  # The internet came back
+                self.internet_available.set()  # Record that it works again
+                logger.warning("INTERNET IS BACK")  # Tell the user
+            elif not internet_works and was_available:  # The internet just went down
+                self.internet_available.clear()  # Record that it does not work
+                self.outage_occurred = (
+                    True  # Remember that Chromium must be restarted afterwards
+                )
+                should_close_chromium = True  # Chromium has to be closed
+                logger.error(
+                    "INTERNET IS DOWN: neither %s responded",
+                    " nor ".join(INTERNET_CHECK_HOSTS),
+                )  # Tell the user
+        if (
+            should_close_chromium and self.outage_close_function is not None
+        ):  # Close Chromium outside the lock
+            try:  # Closing can fail
+                self.outage_close_function()  # Close Chromium
+            except Exception:  # Anything unexpected
+                logger.exception(
+                    "Could not close Chromium after the internet went down"
+                )  # Log the details
+
+    def confirm_internet_is_down(
+        self,
+    ) -> bool:  # Check right now whether the internet is down
+        internet_works = check_internet_connection()  # Do a live check
+        self.update_state(
+            internet_works
+        )  # Update the shared state and close Chromium if needed
+        return not internet_works  # True when the internet is down
+
+    def raise_if_internet_is_down(
+        self,
+    ) -> None:  # Cheap check used before every request
+        if (
+            not self.internet_available.is_set()
+        ):  # The monitor says the internet is down
+            raise InternetOutageError(
+                "The internet is down"
+            )  # Make the restart logic wait for it
+
+    def consume_outage_flag(
+        self,
+    ) -> bool:  # Tell whether an outage happened since the last restart
+        with self.state_lock:  # Only one thread may change the state at a time
+            outage_happened = self.outage_occurred  # Read the flag
+            self.outage_occurred = False  # Reset it
+        return outage_happened  # Give the old value back
+
+    def wait_until_available(self) -> None:  # Block until the internet works
+        waited_seconds = 0  # Counts how long we have waited
+        while not self.internet_available.wait(
+            timeout=INTERNET_CHECK_INTERVAL_IN_SECONDS
+        ):  # Wait for the "works" signal
+            waited_seconds += (
+                INTERNET_CHECK_INTERVAL_IN_SECONDS  # Add the time we just waited
+            )
+            logger.info(
+                "Still waiting for the internet (%.0f seconds so far)", waited_seconds
+            )  # Show progress
+        if waited_seconds > 0:  # Check whether we really had to wait
+            logger.info(
+                "The internet is back after about %.0f seconds", waited_seconds
+            )  # Record it
+
+
+# ============================================================== 14. BROWSER SESSION AND RESTARTS
 def is_browser_closed_error(
     playwright_error: Exception,
 ) -> bool:  # Check whether an error means Chromium is gone
@@ -1327,8 +1666,18 @@ def is_browser_closed_error(
 
 class BrowserSession:  # Owns Chromium and both tabs, and can restart them if Chromium closes
     def __init__(
-        self, playwright_instance, chromium_executable_path: str
-    ) -> None:  # Remember how to start Chromium
+        self,
+        playwright_instance,
+        chromium_executable_path: str,
+        internet_monitor: InternetMonitor,
+    ) -> None:  # Setup
+        self.internet_monitor = internet_monitor  # Tells us whether the internet works
+        self.download_page = (
+            None  # The temporary download tab, only set while it is open
+        )
+        self.is_opening_download_tab = (
+            False  # True for a moment while we open the download tab ourselves
+        )
         self.playwright_instance = playwright_instance  # The running Playwright
         self.chromium_executable_path = (
             chromium_executable_path  # Where Chromium is installed
@@ -1336,7 +1685,6 @@ class BrowserSession:  # Owns Chromium and both tabs, and can restart them if Ch
         self.chromium_process = None  # The Chromium program, once it has been started
         self.connected_browser = None  # Playwright's connection to Chromium
         self.results_page = None  # Tab used for browsing the search results
-        self.download_page = None  # Tab used only for downloading
         self.restart_count = 0  # How many times Chromium had to be restarted
 
     def start(self) -> None:  # Start Chromium and open both tabs
@@ -1359,27 +1707,133 @@ class BrowserSession:  # Owns Chromium and both tabs, and can restart them if Ch
         browser_context = self.connected_browser.contexts[
             0
         ]  # Use Chromium's normal browsing context
-        self.results_page = (
-            browser_context.pages[0]
-            if browser_context.pages
-            else browser_context.new_page()
-        )  # First tab
+        open_tabs = list(browser_context.pages)  # The tabs Chromium opened by itself
+        logger.info(
+            "Chromium started with %d tab(s)", len(open_tabs)
+        )  # Record how many tabs there are
+        if open_tabs:  # Chromium opened at least one tab
+            self.results_page = open_tabs[
+                0
+            ]  # Use the first tab for browsing the search results
+        else:  # Chromium opened no tab at all
+            self.results_page = (
+                browser_context.new_page()
+            )  # Open one tab for browsing the search results
+        for extra_tab in open_tabs[1:]:  # Every further tab is not needed
+            logger.info(
+                "Closing an unneeded extra tab: %s", extra_tab.url
+            )  # Record which tab is closed
+            try:  # Closing can fail if the tab is already gone
+                extra_tab.close()  # Close the tab
+            except PlaywrightError as close_error:  # The tab could not be closed
+                logger.debug(
+                    "Could not close the extra tab (ignored): %s", close_error
+                )  # Record it
         self.results_page.set_default_timeout(
             NAVIGATION_TIMEOUT_IN_MILLISECONDS
         )  # Default time limit for page actions
         attach_browser_event_logging(
             self.results_page
         )  # Start logging everything the results tab does
+        browser_context.on(
+            "page", self.close_unexpected_new_tab
+        )  # Close any popup or extra tab the moment it opens
+        self.results_page.bring_to_front()  # Show the results tab
+
+    def close_unexpected_new_tab(
+        self, new_tab: Page
+    ) -> None:  # Close tabs that nobody asked for
+        if (
+            self.is_opening_download_tab
+            or new_tab is self.results_page
+            or new_tab is self.download_page
+        ):  # A wanted tab
+            return  # Leave it open
+        logger.info(
+            "Closing an unexpected new tab: %s", new_tab.url
+        )  # Record which tab is closed
+        try:  # Closing can fail if the tab is already gone
+            new_tab.close()  # Close the tab
+        except PlaywrightError as close_error:  # The tab could not be closed
+            logger.debug(
+                "Could not close the unexpected tab (ignored): %s", close_error
+            )  # Record it
+
+    def close_unneeded_tabs(
+        self,
+    ) -> None:  # Close every tab except the results tab and the download tab
+        browser_context = self.connected_browser.contexts[
+            0
+        ]  # Chromium's normal browsing context
+        closed_tab_count = 0  # Counts the tabs that were closed
+        for open_tab in list(browser_context.pages):  # Look at every open tab
+            if (
+                open_tab is self.results_page or open_tab is self.download_page
+            ):  # A tab we need
+                continue  # Keep it
+            logger.info(
+                "Closing an unneeded tab: %s", open_tab.url
+            )  # Record which tab is closed
+            try:  # Closing can fail if the tab is already gone
+                open_tab.close()  # Close the tab
+                closed_tab_count += 1  # Count it
+            except PlaywrightError as close_error:  # The tab could not be closed
+                logger.debug(
+                    "Could not close the unneeded tab (ignored): %s", close_error
+                )  # Record it
+        logger.debug(
+            "Tab check: closed %d tab(s), %d tab(s) remain open",
+            closed_tab_count,
+            len(browser_context.pages),
+        )  # Summary
+
+    def close_chromium_for_outage(
+        self,
+    ) -> None:  # Close Chromium because the internet is down (runs in the monitor thread)
+        logger.error("Closing Chromium because the internet is down")  # Record it
+        stop_chromium_process(
+            self.chromium_process
+        )  # Close the Chromium program, Playwright is not touched here
+
+    @contextmanager  # Turns the method below into something that can be used in a "with" block
+    def temporary_download_tab(
+        self,
+    ) -> Iterator[Page]:  # Open a second tab only while downloads need it
+        browser_context = self.connected_browser.contexts[
+            0
+        ]  # Chromium's normal browsing context
+        logger.info("Opening a temporary second tab for downloading")  # Record it
+        self.is_opening_download_tab = (
+            True  # Tell the popup guard that this new tab is wanted
+        )
+        try:  # Make sure the flag is always reset
+            download_page = browser_context.new_page()  # Open the second tab
+        finally:  # Always runs
+            self.is_opening_download_tab = (
+                False  # The popup guard may close unexpected tabs again
+            )
         self.download_page = (
-            browser_context.new_page()
-        )  # Open a second tab that is used only for downloading
-        self.download_page.set_default_timeout(
+            download_page  # Remember it so the guards leave it alone while it is open
+        )
+        download_page.set_default_timeout(
             NAVIGATION_TIMEOUT_IN_MILLISECONDS
         )  # Default time limit for it
         attach_browser_event_logging(
-            self.download_page
+            download_page
         )  # Start logging everything the download tab does
-        self.results_page.bring_to_front()  # Show the results tab again
+        try:  # Make sure the tab is always closed again
+            yield download_page  # Hand the tab to the code inside the "with" block
+        finally:  # Always runs, even after an error
+            self.download_page = None  # The download tab is going away
+            logger.info("Closing the temporary download tab")  # Record it
+            try:  # Closing can fail if Chromium itself is gone
+                download_page.close()  # Close the second tab
+                self.results_page.bring_to_front()  # Show the results tab again
+            except PlaywrightError as close_error:  # The tab or the browser was already gone
+                logger.debug(
+                    "Could not close the download tab cleanly (ignored): %s",
+                    close_error,
+                )  # Record it
 
     def stop(self) -> None:  # Disconnect Playwright and close Chromium
         if self.connected_browser is not None:  # Check whether we are connected
@@ -1399,13 +1853,20 @@ class BrowserSession:  # Owns Chromium and both tabs, and can restart them if Ch
     def restart(
         self,
     ) -> None:  # Start a fresh Chromium after the old one closed or crashed
-        self.restart_count += 1  # Count this restart
         if (
-            self.restart_count > MAXIMUM_BROWSER_RESTARTS
-        ):  # Check whether we have restarted too often
-            raise RuntimeError(
-                f"Chromium closed more than {MAXIMUM_BROWSER_RESTARTS} times, giving up"
-            )  # Stop the run
+            self.internet_monitor.consume_outage_flag()
+        ):  # Check whether this restart is only because the internet was down
+            logger.info(
+                "This restart is caused by an internet outage, so it does not count towards the limit"
+            )  # Say so
+        else:  # The restart has another reason, such as a crash
+            self.restart_count += 1  # Count this restart
+            if (
+                self.restart_count > MAXIMUM_BROWSER_RESTARTS
+            ):  # Check whether we have restarted too often
+                raise RuntimeError(
+                    f"Chromium closed more than {MAXIMUM_BROWSER_RESTARTS} times, giving up"
+                )  # Stop the run
         exit_code = (
             self.chromium_process.poll() if self.chromium_process is not None else None
         )  # How Chromium ended
@@ -1419,6 +1880,7 @@ class BrowserSession:  # Owns Chromium and both tabs, and can restart them if Ch
             MAXIMUM_BROWSER_RESTARTS,
         )  # Record it
         self.stop()  # Close whatever is left of the old Chromium
+        self.internet_monitor.wait_until_available()  # Do not start Chromium until the internet works
         time.sleep(3)  # Give the system a moment to free the debugging port
         self.start()  # Start a fresh Chromium with two new tabs
         warm_up_session_on_home_page(
@@ -1433,6 +1895,12 @@ def run_with_browser_restarts(
         try:  # The step may fail if Chromium closes
             step_function()  # Run the step
             return  # The step finished, so we are done
+        except InternetOutageError as internet_outage_error:  # The internet went down
+            logger.warning(
+                "Internet outage during %s: %s", step_description, internet_outage_error
+            )  # Record it
+            browser_session.restart()  # Wait for the internet, then start a fresh Chromium
+            continue  # Run the same step again, finished URLs are skipped through the database
         except PlaywrightError as playwright_error:  # A browser error happened
             if is_browser_closed_error(
                 playwright_error
@@ -1444,13 +1912,22 @@ def run_with_browser_restarts(
                 )  # Log
                 browser_session.restart()  # Start a new Chromium, which raises an error if restarts ran out
                 continue  # Run the same step again, finished URLs are skipped through the database
+            if (
+                browser_session.internet_monitor.confirm_internet_is_down()
+            ):  # Check whether the internet being down is the cause
+                logger.warning(
+                    "The internet is down, so the error during %s is expected",
+                    step_description,
+                )  # Say so
+                browser_session.restart()  # Wait for the internet, then start a fresh Chromium
+                continue  # Run the same step again
             logger.exception(
                 "Browser error during %s, skipping this step", step_description
             )  # Log the full error
             return  # Go on with the next step instead of crashing the whole run
 
 
-# ============================================================== 14. MAIN PROGRAM
+# ============================================================== 15. MAIN PROGRAM
 def log_run_statistics(
     run_statistics: dict, label: str
 ) -> None:  # Print the running totals
@@ -1476,6 +1953,9 @@ def run_downloader() -> None:  # Run the whole job from start to finish
     register_existing_pdf_files(
         database_connection
     )  # Remember PDFs that are already in the folder
+    ignore_non_usa_english_urls(
+        database_connection
+    )  # Skip old pending URLs that are not USA English
     prepare_chromium_profile_preferences()  # Make Chromium download PDFs instead of previewing them
     run_statistics = {  # Running totals for the whole run
         "downloaded": 0,  # Files saved
@@ -1489,11 +1969,18 @@ def run_downloader() -> None:  # Run the whole job from start to finish
             chromium_executable_path = find_chromium_executable_path(
                 playwright_instance
             )  # Find Playwright's Chromium
+            internet_monitor = (
+                InternetMonitor()
+            )  # Prepare the background internet check
             browser_session = BrowserSession(
-                playwright_instance, chromium_executable_path
-            )  # Prepare the session
-            try:  # Make sure Chromium is always closed at the end
-                browser_session.start()  # Start Chromium and open both tabs
+                playwright_instance, chromium_executable_path, internet_monitor
+            )  # Session
+            try:  # Make sure the monitor and Chromium are always stopped at the end
+                internet_monitor.start(
+                    browser_session.close_chromium_for_outage
+                )  # Check the internet in the background
+                internet_monitor.wait_until_available()  # Do not start Chromium while the internet is down
+                browser_session.start()  # Start Chromium with a single results tab
                 if not warm_up_session_on_home_page(
                     browser_session.results_page
                 ):  # Visit the home page first
@@ -1512,8 +1999,7 @@ def run_downloader() -> None:  # Run the whole job from start to finish
                         browser_session,  # The session that can be restarted
                         f"keyword '{search_keyword}'",  # Description used in log messages
                         lambda: collect_and_download_pdf_urls_for_keyword(  # The work to do for this keyword
-                            browser_session.results_page,  # Current results tab
-                            browser_session.download_page,  # Current download tab
+                            browser_session,  # Gives access to the current tabs
                             database_connection,  # Database that tracks URLs and files
                             search_keyword,  # Keyword to search for
                             run_statistics,  # Running totals
@@ -1523,8 +2009,8 @@ def run_downloader() -> None:  # Run the whole job from start to finish
                 run_with_browser_restarts(  # Retry pending URLs, restarting Chromium if it closes
                     browser_session,  # The session that can be restarted
                     "the retry of pending URLs",  # Description used in log messages
-                    lambda: download_pdf_urls(  # The work to do
-                        browser_session.download_page,  # Current download tab
+                    lambda: download_pdf_urls_in_temporary_tab(  # The work to do
+                        browser_session,  # Opens the download tab only if something needs downloading
                         database_connection,  # Database that tracks URLs and files
                         load_unprocessed_urls(
                             database_connection
@@ -1533,6 +2019,7 @@ def run_downloader() -> None:  # Run the whole job from start to finish
                     ),  # End of the download work
                 )  # End of the restart wrapper
             finally:  # Always runs, even after an error
+                internet_monitor.stop()  # Stop the background internet check
                 browser_session.stop()  # Disconnect Playwright and close Chromium
     except AccessBlockedError as access_blocked_error:  # The website blocked us too many times in a row
         logger.error(
