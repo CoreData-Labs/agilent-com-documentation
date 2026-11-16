@@ -1,5 +1,5 @@
 #!/usr/bin/env python3  # Run this file with Python 3
-r"""
+"""
 Download all SDS / MSDS PDFs from Agilent's chemical-standards search page using
 invisible_playwright (Playwright on an anti-detect Firefox).
 
