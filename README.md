@@ -120,13 +120,22 @@ source .venv/bin/activate
 pip install -r requirements.txt
 
 # Install the required Python packages
-pip install playwright
+pip install playwright invisible-playwright
 
 # Install Playwright system dependencies
 playwright install --with-deps
 
 # Install Playwright Chromium
 playwright install chromium
+
+# Install Playwright Firefox
+playwright install firefox
+
+# Install Invisible Playwright Engine Using Invisible Playwright
+invisible-playwright fetch
+
+# Install Invisible Playwright Engine Using Python
+python3 -m invisible_playwright fetch
 
 # Run the script
 python3 download_sds.py
