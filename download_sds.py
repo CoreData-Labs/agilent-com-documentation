@@ -1,57 +1,61 @@
 #!/usr/bin/env python3  # Run this file with Python 3
-"""
+r"""
 Download all SDS / MSDS PDFs from Agilent's chemical-standards search page using
-Chromium via Playwright.
+invisible_playwright (Playwright on an anti-detect Firefox).
 
 Overview
 --------
-1. Starts Chromium as a normal window and attaches Playwright to it.
-2. Visits the Agilent home page briefly, then searches keywords a-z and 0-9.
-3. After every result page, downloads the PDFs found there right away, using a
+1. Starts the browser through invisible_playwright and opens its first tab.
+2. Opens the Agilent home page and spends about 30 seconds moving the mouse and scrolling.
+   Then opens 3 different pages from the home page, about 30 seconds on each, moving the
+   mouse along curved paths, scrolling and pressing random letter keys like a person.
+   The same mouse, scrolling and random-letter activity runs on every page it visits,
+   including while searching and downloading. Letters are only pressed, never submitted,
+   so no new search is started.
+3. Only then searches keywords a-z and 0-9.
+4. After every result page, downloads the PDFs found there right away, using a
    second tab that's opened only when there's something to download.
-4. A SQLite database remembers every URL and file name, so nothing is downloaded twice.
-5. If Chromium crashes or closes, it's restarted and work continues where it stopped.
-6. "Page may no longer exist" error pages are skipped (marked done, never retried).
-7. Random pauses, exponential back-off on blocks, and a stop-after-N-blocks rule
+5. A SQLite database remembers every URL and file name, so nothing is downloaded twice.
+6. If the browser crashes or closes, it's restarted and work continues where it stopped.
+7. "Page may no longer exist" error pages are skipped (marked done, never retried).
+8. Random pauses, exponential back-off on blocks, and a stop-after-N-blocks rule
    keep the traffic gentle and stop the run if the site is blocking us.
-8. A background thread pings 1.1.1.1 / 8.8.8.8. If neither answers, Chromium is
-   closed, and only restarted (with scraping resumed) once the internet is back.
-9. Only USA English files are downloaded (file names ending in _NAEnglish.pdf).
-10. Only the results tab stays open permanently; the download tab exists only
+9. A background thread pings 1.1.1.1 / 8.8.8.8. If neither answers, the browser is
+   closed (by the main thread at its next step), and only restarted (with scraping
+   resumed) once the internet is back.
+10. Only USA English files are downloaded (file names ending in _NAEnglish.pdf).
+11. Only the results tab stays open permanently; the download tab exists only
     while downloading; any other tab or popup is closed immediately.
-11. Everything is logged to the console.
-
-Setup: pip install playwright   &&   playwright install chromium
-Run:   python download_sds.py
+12. Everything is logged to the console.
 """
 
-import json  # Reads and writes Chromium's Preferences file
 import logging  # Prints log lines to the console
-import os  # Reads environment variables and checks for root / file existence
+import math  # Distance and curve calculations for human-like mouse movement
 import random  # Picks random pause lengths
 import re  # Regular expressions for link matching and text cleaning
 import shutil  # Finds the "ping" program on the system PATH
 import socket  # Opens a plain TCP connection when ping is unavailable
 import sqlite3  # Built-in database used to remember what's already downloaded
 import string  # Supplies the lowercase letters and digits used as search keywords
-import subprocess  # Starts Chromium and runs "ping" as external processes
+import subprocess  # Runs "ping" as an external process
 import sys  # Gives access to stdout and the current platform name
-import threading  # Runs the internet check and Chromium's output reader in the background
+import threading  # Runs the internet check in the background
 import time  # Provides sleep() and the current time
 from contextlib import contextmanager  # Turns a method into a usable "with" block
 from pathlib import Path  # Object-oriented filesystem paths
 from typing import Iterator, Optional  # Type hints for generators and optional values
 from urllib.parse import unquote, urlparse  # Helpers to read a file name out of a URL
 
-from playwright.sync_api import (  # Import the Playwright types and classes this script uses
+from invisible_playwright import (
+    InvisiblePlaywright,
+)  # Playwright on an anti-detect Firefox
+
+from invisible_playwright._pw.sync_api import (  # invisible_playwright bundles its own Playwright, so its errors are only caught by this copy of the classes
     Dialog,
     Download,
-    Frame,
     Page,
-    Response,  # Browser objects used in type hints
     Error as PlaywrightError,  # Base error class raised by Playwright
     TimeoutError as PlaywrightTimeoutError,  # Error raised when Playwright waits too long
-    sync_playwright,  # Starts Playwright using its synchronous API
 )
 
 # ============================================================== SETTINGS
@@ -62,9 +66,9 @@ SEARCH_URL_TEMPLATE = (  # Search page URL with a placeholder for the keyword
 )  # End of the template
 SEARCH_KEYWORDS = list(string.ascii_lowercase + string.digits)  # Keywords a-z then 0-9
 HOME_PAGE_URL = "https://www.agilent.com/"  # Page visited first, like a normal visitor
-HOME_PAGE_WARM_UP_SECONDS = (
-    3  # How long to stay on the home page before scraping starts
-)
+HOME_PAGE_BROWSING_SECONDS = 30  # How long to move the mouse and scroll on the home page before opening other pages
+OTHER_PAGES_TO_VISIT = 3  # How many different pages are opened from the home page
+OTHER_PAGE_BROWSING_SECONDS = 30  # How long to stay on each of those pages
 REQUIRED_FILE_NAME_ENDING = (
     "_NAEnglish.pdf"  # Only files whose name ends like this are downloaded
 )
@@ -75,16 +79,13 @@ DOWNLOAD_FOLDER = Path(
 DATABASE_FILE_PATH = Path(
     "download_history.sqlite3"
 ).resolve()  # Absolute path of the SQLite file
-CHROMIUM_PROFILE_FOLDER = Path(
-    "chromium_profile"
-).resolve()  # Folder for this script's own Chromium profile
 MAXIMUM_FILE_NAME_STEM_LENGTH = 150  # Longest allowed file name, not counting ".pdf"
 
 MAXIMUM_RESULT_PAGES_PER_KEYWORD = (
     200  # Safety limit on result pages followed per keyword
 )
 NAVIGATION_TIMEOUT_MS = 30_000  # How long to wait for a page to open
-DOWNLOAD_TIMEOUT_MS = 60_000  # How long to wait for Chromium to start one download
+DOWNLOAD_TIMEOUT_MS = 60_000  # How long to wait for the browser to start one download
 
 PAUSE_BETWEEN_RESULT_PAGES = (
     2.0,
@@ -98,6 +99,10 @@ PAUSE_BETWEEN_KEYWORDS = (
     5.0,
     10.0,
 )  # Random pause range (seconds) before the next keyword
+ACTIVITY_AFTER_OPENING_SEARCH_PAGE = (
+    3.0,
+    6.0,
+)  # Random time range (seconds) of mouse and keyboard activity after a search page opens
 MAX_ACCESS_DENIED_ATTEMPTS = (
     3  # How many times to retry a page that shows "Access Denied"
 )
@@ -106,7 +111,7 @@ ACCESS_DENIED_BACKOFF_SECONDS = (
 )
 MAX_CONSECUTIVE_BLOCKS = 5  # Stop the whole run after this many blocks in a row
 MAX_BROWSER_RESTARTS = (
-    5  # How many times Chromium may be restarted after closing or crashing
+    5  # How many times the browser may be restarted after closing or crashing
 )
 
 INTERNET_CHECK_HOSTS = (
@@ -119,14 +124,6 @@ TCP_FALLBACK_PORT = (
     53  # Port used for a plain connection test when ping is unavailable (DNS port)
 )
 TCP_FALLBACK_TIMEOUT_SECONDS = 2  # How long to wait for that fallback connection test
-
-CHROMIUM_DEBUGGING_PORT = 0  # 0 means Chromium picks a free port itself
-CHROMIUM_STARTUP_TIMEOUT_SECONDS = (
-    60  # How long to wait for Chromium to be ready after starting it
-)
-CHROMIUM_DISABLE_SANDBOX_IF_NEEDED = (
-    True  # Start again with --no-sandbox if this system disallows the sandbox
-)
 
 logger = logging.getLogger(
     "sds_downloader"
@@ -193,11 +190,11 @@ def attach_browser_event_logging(
     page.on(
         "download",
         lambda d: logger.info(
-            "CHROMIUM DOWNLOAD STARTED url=%s suggested_name=%s",
+            "BROWSER DOWNLOAD STARTED url=%s suggested_name=%s",
             d.url,
             d.suggested_filename,
         ),
-    )  # Log every download Chromium starts
+    )  # Log every download the browser starts
 
     def handle_dialog(
         dialog: Dialog,
@@ -403,196 +400,7 @@ def build_safe_file_name(
     ) + ".pdf"  # Fall back to "document" if nothing is left, then re-add .pdf
 
 
-# ============================================================== CHROMIUM PROCESS
-
-
-def prepare_chromium_profile_preferences() -> None:  # Make Chromium download PDFs instead of previewing them
-    """Tell Chromium to download PDFs instead of previewing them, and never prompt for a save location."""
-    profile_dir = (
-        CHROMIUM_PROFILE_FOLDER / "Default"
-    )  # Folder that holds Chromium's profile settings
-    profile_dir.mkdir(
-        parents=True, exist_ok=True
-    )  # Create the folder if it doesn't exist
-    prefs_path = profile_dir / "Preferences"  # Chromium's preferences file
-    prefs = {}  # Start with empty preferences
-    if prefs_path.exists():  # Check whether Chromium already created a preferences file
-        try:  # The existing file might be damaged
-            prefs = json.loads(prefs_path.read_text(encoding="utf-8"))  # Load it
-        except json.JSONDecodeError:  # The file couldn't be parsed
-            logger.warning(
-                "Chromium preferences file was unreadable and will be replaced"
-            )  # Tell the user
-    prefs.setdefault("plugins", {})[
-        "always_open_pdf_externally"
-    ] = True  # Download PDFs instead of showing a viewer
-    prefs.setdefault("download", {})[
-        "prompt_for_download"
-    ] = False  # Never ask where to save
-    prefs_path.write_text(
-        json.dumps(prefs), encoding="utf-8"
-    )  # Save the preferences back to disk
-
-
-def find_chromium_executable_path(
-    playwright_instance,
-) -> str:  # Locate the Chromium Playwright installed
-    path = (
-        playwright_instance.chromium.executable_path
-    )  # Ask Playwright where its Chromium is
-    if not Path(path).is_file():  # Check whether the program really exists
-        raise FileNotFoundError(
-            f"Chromium was not found at {path}. Run: playwright install chromium"
-        )  # Stop with a clear fix
-    return path  # Use this Chromium
-
-
-def allow_local_connections_without_proxy() -> None:  # Keep a system proxy from breaking the link to Chromium
-    """Make sure a system proxy setting can't break Playwright's local connection to Chromium."""
-    for var in (
-        "NO_PROXY",
-        "no_proxy",
-    ):  # Both spellings are used by different programs
-        entries = [
-            e.strip() for e in os.environ.get(var, "").split(",") if e.strip()
-        ]  # Read and split the current value
-        for addr in (
-            "127.0.0.1",
-            "localhost",
-            "::1",
-        ):  # Addresses that must never go through a proxy
-            if addr not in entries:  # The address is missing from the list
-                entries.append(addr)  # Add it
-        os.environ[var] = ",".join(entries)  # Save the updated value
-
-
-def start_chromium_process(
-    executable_path: str, use_no_sandbox: bool
-) -> subprocess.Popen:  # Start Chromium as a normal process
-    command = [  # The command line used to start Chromium
-        executable_path,  # The Chromium program itself
-        f"--remote-debugging-port={CHROMIUM_DEBUGGING_PORT}",  # Allow Playwright to connect to this Chromium
-        f"--user-data-dir={CHROMIUM_PROFILE_FOLDER}",  # Use this script's own profile folder
-        "--no-first-run",  # Skip the first-run welcome screens
-        "--no-default-browser-check",  # Don't ask to become the default browser
-    ]  # End of the command line
-    running_as_root = (
-        hasattr(os, "geteuid") and os.geteuid() == 0
-    )  # Linux refuses the sandbox when run as root
-    if running_as_root or use_no_sandbox:  # The sandbox must be switched off
-        command.append("--no-sandbox")  # Switch the sandbox off
-        logger.warning(
-            "Starting Chromium without its sandbox (%s)",
-            "running as root" if running_as_root else "system requires it",
-        )  # Explain why
-
-    CHROMIUM_PROFILE_FOLDER.mkdir(
-        parents=True, exist_ok=True
-    )  # Make sure the profile folder exists
-    (CHROMIUM_PROFILE_FOLDER / "DevToolsActivePort").unlink(
-        missing_ok=True
-    )  # Remove any stale port file
-
-    logger.info("Starting Chromium: %s", " ".join(command))  # Record the exact command
-    process = subprocess.Popen(  # Start Chromium as a separate normal process
-        command,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,  # Capture its combined output
-        text=True,
-        errors="replace",
-        bufsize=1,  # Read as text, line by line, tolerating odd bytes
-    )  # End of the start call
-    process.recent_output_lines = (
-        []
-    )  # Keeps Chromium's recent messages so we can look for known problems
-
-    def forward_output():  # Copy Chromium's own messages into our log
-        if process.stdout is None:  # Check whether Chromium's output is available
-            return  # Nothing to copy
-        for (
-            line
-        ) in process.stdout:  # Read Chromium's output line by line until it closes
-            logger.debug(
-                "CHROMIUM OUTPUT: %s", line.rstrip()
-            )  # Write the line to the log
-            process.recent_output_lines.append(
-                line.rstrip()
-            )  # Keep the line for later checks
-            del process.recent_output_lines[:-200]  # Keep only the latest 200 lines
-
-    process.output_thread = threading.Thread(
-        target=forward_output, name="chromium-output", daemon=True
-    )  # Create the output-reading thread
-    process.output_thread.start()  # Start the thread
-    return process  # Give the running process back to the caller
-
-
-def chromium_failed_because_of_sandbox(
-    process: subprocess.Popen,
-) -> bool:  # Did Chromium stop over its sandbox?
-    process.output_thread.join(
-        timeout=3
-    )  # Give the output thread a moment to read the last messages
-    return any(
-        "no usable sandbox" in line.lower() for line in process.recent_output_lines
-    )  # Look for the known failure message
-
-
-def wait_for_chromium_debugging_endpoint(
-    process: subprocess.Popen,
-) -> Optional[str]:  # Wait until Chromium is ready
-    deadline = (
-        time.time() + CHROMIUM_STARTUP_TIMEOUT_SECONDS
-    )  # Moment when we give up waiting
-    port_file = (
-        CHROMIUM_PROFILE_FOLDER / "DevToolsActivePort"
-    )  # File Chromium writes once it's listening
-    while time.time() < deadline:  # Keep checking until the deadline passes
-        if process.poll() is not None:  # Check whether Chromium closed by itself
-            logger.error(
-                "Chromium exited early with code %s", process.returncode
-            )  # Say why we're giving up
-            return None  # Chromium isn't running
-        if port_file.exists():  # Chromium may have written its address by now
-            try:  # Reading can fail while Chromium is still writing
-                lines = port_file.read_text(
-                    encoding="utf-8"
-                ).splitlines()  # Read the file line by line
-                if (
-                    len(lines) >= 2 and lines[0].strip().isdigit()
-                ):  # The file must have a port and a path
-                    return f"ws://127.0.0.1:{int(lines[0].strip())}{lines[1].strip()}"  # Line 1 is the port, line 2 the path
-            except OSError:  # The file couldn't be read right now
-                pass  # Try again on the next loop
-        time.sleep(0.5)  # Wait a moment and look again
-    logger.error(
-        "Chromium was not ready after %d seconds; see CHROMIUM OUTPUT above",
-        CHROMIUM_STARTUP_TIMEOUT_SECONDS,
-    )  # Say
-    return None  # Chromium never became ready
-
-
-def stop_chromium_process(
-    process: Optional[subprocess.Popen],
-) -> None:  # Close the Chromium we started
-    if process is None or process.poll() is not None:  # Nothing to stop
-        return  # Leave the function
-    process.terminate()  # Ask Chromium to close
-    try:  # Chromium may take a moment to close
-        process.wait(timeout=10)  # Wait up to 10 seconds
-    except subprocess.TimeoutExpired:  # Chromium didn't close in time
-        process.kill()  # Force Chromium to stop
-
-
 # ============================================================== PACING AND BLOCK TRACKING
-
-
-def pause_like_a_person(low: float, high: float, reason: str) -> None:  # Random pause
-    seconds = random.uniform(low, high)  # Pick a random length inside the range
-    logger.debug(
-        "Pausing %.1f seconds (%s)", seconds, reason
-    )  # Record the pause and why it happens
-    time.sleep(seconds)  # Wait for that long
 
 
 def register_access_block(
@@ -736,8 +544,8 @@ def extract_pdf_urls_from_page(
     page: Page,
 ) -> set:  # Find every PDF-looking URL on the page
     found = set()  # Collects the URLs found on this page
-    for href in page.eval_on_selector_all(
-        "a[href]", "els => els.map(e => e.href)"
+    for href in page.evaluate(
+        "() => Array.from(document.querySelectorAll('a[href]')).map(e => e.href)"
     ):  # Read the address of every link on the page
         if href.startswith("http") and PDF_OR_SDS_LINK_PATTERN.search(
             href
@@ -794,10 +602,9 @@ def click_next_page_button(
                     candidate.get_attribute("class") or ""
                 ):  # Other disabled markers
                     continue  # Skip this candidate
-                candidate.scroll_into_view_if_needed(
-                    timeout=5000
-                )  # Bring the button into view
-                candidate.click(timeout=5000)  # Click the next page button
+                human_click_element(
+                    page, candidate
+                )  # Move the pointer to the button like a person and click it
                 logger.info(
                     "Clicked next page button (%s)", selector
                 )  # Record the click
@@ -810,9 +617,357 @@ def click_next_page_button(
     return False  # No usable next page button was found
 
 
+# ============================================================== HUMAN-LIKE BEHAVIOUR
+#
+# Three parts:
+#   1. Links and URLs     -- which links a casual visitor might click
+#   2. Human-like input   -- curved mouse paths, wheel scrolling, random key presses, clicking,
+#                            and pausing with activity instead of sitting still
+#   3. The routine        -- home page first, then three other pages, then scraping starts
+#
+# Mouse movement, scrolling and random letter keys happen on every page the script visits:
+# the home page, the three other pages, the search pages, and while downloading.
+# Random letters are only pressed, never submitted: Enter and other special keys are never used,
+# and any focused text box is un-focused first, so no new search is ever started.
+
+# ---------------------------------------------------------------- 1. LINKS AND URLS
+
+EXCLUDED_BROWSING_LINK_PATTERN = re.compile(  # Pattern for links a casual visitor wouldn't click
+    r"log-?in|log-?out|sign-?in|sign-?out|register|cart|checkout|account"  # Login, logout, sign-in, registration, shopping and account pages
+    r"|\.pdf|msds|/sds|mailto:|tel:|javascript:",  # Documents, e-mail, phone and script links
+    re.IGNORECASE,  # Ignore capital letters
+)  # End of the pattern
+LINK_CANDIDATES_SCRIPT = (  # JavaScript that describes every link on the page, in page order
+    "() => Array.from(document.querySelectorAll('a[href]')).map((a, index) => {"  # Go through every link and remember its position
+    "const box = a.getBoundingClientRect();"  # Size and position of the link on screen
+    "const style = getComputedStyle(a);"  # How the link is displayed
+    "return {"  # Start the description of this link
+    "index: index,"  # Position of the link among all links
+    "href: a.href,"  # Full address of the link
+    "visible: box.width > 20 && box.height > 10 && style.visibility !== 'hidden' && style.display !== 'none',"  # Is it big enough and shown
+    "new_tab: a.target === '_blank',"  # Does it open a new tab
+    "download: a.hasAttribute('download'),"  # Is it a download link
+    "};"  # End of the description of this link
+    "})"  # End of the loop over all links
+)  # End of the script
+UNFOCUS_TEXT_BOXES_SCRIPT = (  # JavaScript that takes the keyboard focus away from any text box
+    "() => { const e = document.activeElement;"  # The element that currently has the focus
+    " if (e && e !== document.body && (['INPUT', 'TEXTAREA', 'SELECT'].includes(e.tagName) || e.isContentEditable)) e.blur(); }"  # If it is a text box, take the focus away
+)  # End of the script
+
+
+def without_fragment(url: str) -> str:  # Drop the "#section" part of a URL
+    return url.split("#")[0]  # Everything before the first "#"
+
+
+def pick_random_internal_link(
+    page: Page, visited: set
+) -> Optional[tuple]:  # Choose a random visible Agilent link we haven't used
+    candidates = []  # Collects (position on the page, address) pairs
+    for item in page.evaluate(LINK_CANDIDATES_SCRIPT):  # Look at every link on the page
+        href = item["href"]  # The full address of the link
+        parsed = urlparse(href)  # Split the address into parts
+        hostname = parsed.hostname or ""  # The website name, empty if missing
+        if (
+            not item["visible"] or item["new_tab"] or item["download"]
+        ):  # Hidden, popup or download link
+            continue  # A normal visitor wouldn't click it here
+        if parsed.scheme not in ("http", "https"):  # Not a normal web address
+            continue  # Skip it
+        if not hostname.endswith("agilent.com"):  # Not an Agilent page
+            continue  # Stay on Agilent's own website
+        if EXCLUDED_BROWSING_LINK_PATTERN.search(href):  # Login, cart, PDFs and similar
+            continue  # Skip it
+        if without_fragment(href) in visited:  # Already visited, or the page we're on
+            continue  # We want different pages
+        candidates.append((item["index"], href))  # This link is a good candidate
+    return random.choice(candidates) if candidates else None  # One at random, if any
+
+
+# ---------------------------------------------------------------- 2. HUMAN-LIKE INPUT
+
+mouse_position = {
+    "x": 200.0,
+    "y": 200.0,
+}  # Where the pointer is now (Playwright can't tell us, so we remember it)
+
+
+def get_viewport_size(page: Page) -> tuple:  # Width and height of the visible page area
+    size = page.viewport_size or {
+        "width": 1280,
+        "height": 720,
+    }  # Fall back to a common size
+    return size["width"], size["height"]  # Give both numbers back
+
+
+def human_mouse_move(
+    page: Page, target_x: float, target_y: float
+) -> None:  # Move the pointer along a curved, uneven path
+    width, height = get_viewport_size(page)  # Size of the page area
+    target_x = min(
+        max(target_x, 1), width - 1
+    )  # Keep the target inside the page horizontally
+    target_y = min(
+        max(target_y, 1), height - 1
+    )  # Keep the target inside the page vertically
+    start_x, start_y = (
+        mouse_position["x"],
+        mouse_position["y"],
+    )  # Where the pointer is now
+    distance = math.hypot(
+        target_x - start_x, target_y - start_y
+    )  # Straight-line distance to travel
+    if distance < 2:  # Already there
+        return  # Nothing to do
+    steps = max(12, min(60, int(distance / 10)))  # Longer moves use more small steps
+    bend = distance * random.uniform(0.1, 0.3)  # How much the path curves
+    control_x = (start_x + target_x) / 2 + random.choice(
+        (-1, 1)
+    ) * bend * random.random()  # Curve point, pulled sideways
+    control_y = (start_y + target_y) / 2 + random.choice(
+        (-1, 1)
+    ) * bend * random.random()  # Curve point, pulled up or down
+    for step in range(1, steps + 1):  # Walk along the curve
+        t = step / steps  # How far along the path we are (0 to 1)
+        eased = (
+            t * t * (3 - 2 * t)
+        )  # Start slowly, speed up in the middle, slow down at the end
+        x = (
+            (1 - eased) ** 2 * start_x
+            + 2 * (1 - eased) * eased * control_x
+            + eased**2 * target_x
+        )  # Point on the curve, horizontal
+        y = (
+            (1 - eased) ** 2 * start_y
+            + 2 * (1 - eased) * eased * control_y
+            + eased**2 * target_y
+        )  # Point on the curve, vertical
+        if step < steps:  # Every step except the last one
+            x += random.uniform(-1.0, 1.0)  # Tiny hand shake, horizontal
+            y += random.uniform(-1.0, 1.0)  # Tiny hand shake, vertical
+        page.mouse.move(x, y)  # Move the pointer to this point
+        time.sleep(random.uniform(0.004, 0.014))  # Tiny pause between steps
+    mouse_position["x"], mouse_position["y"] = (
+        target_x,
+        target_y,
+    )  # Remember where the pointer ended up
+
+
+def human_click_element(
+    page: Page, element
+) -> None:  # Move the pointer to an element like a person and click it
+    element.scroll_into_view_if_needed(timeout=5000)  # Bring the element into view
+    box = element.bounding_box()  # Position and size of the element on screen
+    if box is None:  # The element has no size right now
+        element.click(timeout=5000)  # Fall back to a normal click
+        return  # Done
+    click_x = box["x"] + box["width"] * random.uniform(
+        0.3, 0.7
+    )  # A spot inside the element, horizontal
+    click_y = box["y"] + box["height"] * random.uniform(
+        0.3, 0.7
+    )  # A spot inside the element, vertical
+    human_mouse_move(page, click_x, click_y)  # Move the pointer there like a person
+    time.sleep(random.uniform(0.2, 0.6))  # Short hesitation before clicking
+    page.mouse.click(
+        mouse_position["x"], mouse_position["y"], delay=random.randint(50, 150)
+    )  # Click, holding the button briefly
+
+
+def human_scroll(
+    page: Page, pixels: int
+) -> None:  # Scroll with the mouse wheel in small, uneven notches
+    direction = 1 if pixels > 0 else -1  # Down is positive, up is negative
+    remaining = abs(pixels)  # How much is still left to scroll
+    while remaining > 0:  # Keep scrolling until we've covered the distance
+        notch = min(remaining, random.randint(40, 120))  # Size of this wheel notch
+        page.mouse.wheel(0, direction * notch)  # Turn the wheel a little
+        remaining -= notch  # Count it off
+        time.sleep(random.uniform(0.02, 0.09))  # Short pause between notches
+        if random.random() < 0.08:  # Now and then
+            time.sleep(random.uniform(0.3, 0.9))  # Stop to read for a moment
+
+
+def human_type_random_letters(
+    page: Page,
+) -> None:  # Press a few random letter keys with human-like timing
+    page.evaluate(
+        UNFOCUS_TEXT_BOXES_SCRIPT
+    )  # No text box may have the focus, so the letters can't change a search box
+    for _ in range(random.randint(2, 6)):  # A few key presses
+        letter = random.choice(
+            string.ascii_lowercase
+        )  # Pick a random letter a-z (never Enter or other special keys)
+        page.keyboard.press(
+            letter, delay=random.randint(40, 140)
+        )  # Press and release it, holding the key briefly
+        time.sleep(random.uniform(0.08, 0.35))  # Typing rhythm between keys
+        if random.random() < 0.15:  # Sometimes
+            time.sleep(random.uniform(0.4, 1.0))  # Hesitate like someone thinking
+
+
+def act_like_a_person_on_page(
+    page: Page, seconds: float
+) -> None:  # Move the mouse, scroll and press random letters for a while
+    deadline = time.time() + seconds  # Moment when we stop
+    width, height = get_viewport_size(page)  # Size of the page area
+    while time.time() < deadline:  # Keep going until the time is up
+        try:  # Browser actions can fail while the page is changing
+            roll = random.random()  # Pick what to do next
+            if roll < 0.2:  # Sometimes
+                human_type_random_letters(page)  # Press a few random letters
+            elif roll < 0.55:  # Mostly read the page
+                human_scroll(page, random.randint(200, 650))  # Scroll down
+            elif roll < 0.9:  # Often move the mouse somewhere else
+                human_mouse_move(
+                    page,
+                    random.uniform(40, width - 40),
+                    random.uniform(40, height - 40),
+                )  # Move to a random spot
+            else:  # Occasionally look back up
+                human_scroll(page, -random.randint(100, 300))  # Scroll up a little
+        except PlaywrightError as error:  # The action didn't work
+            if is_browser_closed_error(error):  # The browser itself is gone
+                raise  # Let the caller deal with it
+        remaining = deadline - time.time()  # Time left
+        if remaining > 0:  # Still time to spend
+            time.sleep(
+                min(remaining, random.uniform(0.5, 2.0))
+            )  # Human-like pause between actions
+
+
+def pause_while_acting_like_a_person(
+    page: Page, low: float, high: float, reason: str
+) -> None:  # Wait a random time, acting like a person instead of sitting still
+    seconds = random.uniform(low, high)  # Pick a random length inside the range
+    logger.debug(
+        "Pausing %.1f seconds with mouse and keyboard activity (%s)", seconds, reason
+    )  # Record the pause and why it happens
+    try:  # The browser can fail while we act
+        act_like_a_person_on_page(
+            page, seconds
+        )  # Move the mouse, scroll and press random letters
+    except (
+        PlaywrightError,
+        PlaywrightTimeoutError,
+    ) as error:  # The browser had a problem
+        logger.debug(
+            "Activity during the pause failed: %s", str(error).splitlines()[0]
+        )  # Record it
+        time.sleep(seconds)  # Just wait instead, the next step deals with the browser
+
+
+# ---------------------------------------------------------------- 3. THE BROWSING ROUTINE
+
+
+def open_random_link(
+    page: Page, visited: set
+) -> Optional[str]:  # Click a random link and return the address of the page it opens
+    for _ in range(5):  # Try a few different links if one doesn't work
+        candidate = pick_random_internal_link(page, visited)  # Choose a link
+        if candidate is None:  # No suitable link on this page
+            return None  # Give up
+        index, href = candidate  # Position and address of the link
+        visited.add(without_fragment(href))  # Never choose this one again
+        url_before = without_fragment(page.url)  # Where we are now
+        try:  # Clicking can fail
+            link = page.locator("a[href]").nth(index)  # Find the link by its position
+            human_click_element(
+                page, link
+            )  # Move the pointer to it like a person and click it
+            page.wait_for_url(  # Wait until we really moved to another page
+                lambda url: without_fragment(url)
+                != url_before,  # The address must be different
+                wait_until="domcontentloaded",  # The page must have started loading
+                timeout=8000,  # Give up after 8 seconds
+            )  # End of the wait
+        except (
+            PlaywrightError,
+            PlaywrightTimeoutError,
+        ) as error:  # The click didn't lead anywhere
+            if is_browser_closed_error(error):  # The browser itself is gone
+                raise  # Stop browsing
+            logger.debug("Browsing: link %s did not open a page", href)  # Record it
+            continue  # Try another link
+        return page.url  # We are on a new page
+    return None  # None of the links worked
+
+
+def return_to_home_page(
+    page: Page, home_url: str
+) -> None:  # Go back to the home page like a person would
+    try:  # Going back can fail
+        page.go_back(
+            wait_until="domcontentloaded", timeout=15_000
+        )  # Use the back button
+    except (PlaywrightError, PlaywrightTimeoutError) as error:  # Back didn't work
+        if is_browser_closed_error(error):  # The browser itself is gone
+            raise  # Stop browsing
+    if without_fragment(page.url) != without_fragment(home_url):  # Not on the home page
+        page.goto(
+            HOME_PAGE_URL, wait_until="domcontentloaded"
+        )  # Open it directly instead
+    time.sleep(random.uniform(1.0, 2.0))  # Let the home page draw itself
+
+
+def browse_like_a_normal_user(
+    page: Page,
+) -> None:  # Move around the home page, then open a few different pages from it
+    try:  # Any browser problem just ends the browsing early
+        home_url = page.url  # The page we start from and keep returning to
+        visited = {
+            without_fragment(home_url),
+            without_fragment(HOME_PAGE_URL),
+        }  # Pages already seen
+        logger.info(  # Record the first step
+            "Browsing: mouse, scrolling and random keys on the home page for about %d seconds",  # Message
+            HOME_PAGE_BROWSING_SECONDS,  # Value for %d
+        )  # End of the log call
+        act_like_a_person_on_page(
+            page, HOME_PAGE_BROWSING_SECONDS
+        )  # Home page: mouse, scrolling and random letters
+
+        for visit_number in range(
+            1, OTHER_PAGES_TO_VISIT + 1
+        ):  # Open the other pages one by one
+            visit_started = time.time()  # When this visit began
+            opened_url = open_random_link(
+                page, visited
+            )  # Click a random link on the home page
+            if opened_url is None:  # No link worked
+                logger.warning(
+                    "Browsing: could not open another page, stopping early"
+                )  # Record it
+                break  # Stop browsing
+            logger.info(  # Record the visit
+                "Browsing: page %d/%d opened (about %d seconds on it): %s",  # Message
+                visit_number,  # Value for the first %d
+                OTHER_PAGES_TO_VISIT,  # Value for the second %d
+                OTHER_PAGE_BROWSING_SECONDS,  # Value for the third %d
+                opened_url,  # Value for %s
+            )  # End of the log call
+            time_left = max(
+                2.0, OTHER_PAGE_BROWSING_SECONDS - (time.time() - visit_started)
+            )  # Rest of this visit's time
+            act_like_a_person_on_page(
+                page, time_left
+            )  # Other pages: mouse, scrolling and random letters
+            if visit_number < OTHER_PAGES_TO_VISIT:  # Another visit follows
+                return_to_home_page(page, home_url)  # Go back to the home page first
+    except (
+        PlaywrightError,
+        PlaywrightTimeoutError,
+    ) as error:  # Something went wrong in the browser
+        logger.warning(
+            "Browsing like a normal visitor ended early: %s", str(error).splitlines()[0]
+        )  # Record it, scraping goes on anyway
+        return  # Leave the function
+    logger.info("Finished browsing like a normal visitor")  # Record the end
+
+
 def warm_up_session_on_home_page(
     page: Page,
-) -> bool:  # Visit the home page and stay a short while first
+) -> bool:  # Open the home page and browse around a little first
     logger.info(
         "Warm-up: opening the home page %s", HOME_PAGE_URL
     )  # Record the first step
@@ -828,9 +983,9 @@ def warm_up_session_on_home_page(
             "Warm-up: the home page itself shows Access Denied"
         )  # Record the problem
         return False  # The warm-up failed
-    time.sleep(
-        HOME_PAGE_WARM_UP_SECONDS
-    )  # Stay on the home page for a moment, like a real visitor
+    browse_like_a_normal_user(
+        page
+    )  # Move around the home page and open a few different pages, like a real visitor
     return True  # The warm-up worked
 
 
@@ -889,7 +1044,7 @@ def open_page_politely(
 
 # ============================================================== DOWNLOADING
 
-OUTCOME_DOWNLOAD_STARTED = "download started"  # Chromium started downloading a file
+OUTCOME_DOWNLOAD_STARTED = "download started"  # The browser started downloading a file
 OUTCOME_PAGE_UNAVAILABLE = (
     "page unavailable"  # The link led to the "page may no longer exist" message
 )
@@ -900,19 +1055,27 @@ OUTCOME_NOT_A_DOWNLOAD = (
 OUTCOME_TIMEOUT = "timeout"  # Nothing happened before the time limit
 
 
-def start_chromium_download(
+def start_download(
     page: Page, source_url: str
-) -> tuple:  # Ask Chromium to download one URL
-    """Navigate to a URL and wait for Chromium to report a download, or classify what happened instead."""
-    received = []  # Collects the Download objects as Chromium reports them
-    page.on("download", received.append)  # Start listening for downloads on this tab
+) -> tuple:  # Ask the browser to download one URL
+    """Navigate to a URL and wait for the browser to report a download, or classify what happened instead."""
+    received = []  # Collects the Download objects as the browser reports them
+
+    def collect_download(
+        download: Download,
+    ) -> None:  # Handler must be a normal function, a built-in like list.append can't be registered
+        received.append(download)  # Remember the download
+
+    page.on("download", collect_download)  # Start listening for downloads on this tab
     try:  # Make sure the listener is always removed again
         try:  # Opening a download link can raise an error, which is normal
             response = page.goto(
                 source_url, wait_until="commit", timeout=NAVIGATION_TIMEOUT_MS
             )  # Open the link
-        except PlaywrightError as e:  # Chromium reported an error for the navigation
-            if "Download is starting" in str(e) or "ERR_ABORTED" in str(e):  # Expected
+        except PlaywrightError as e:  # The browser reported an error for the navigation
+            if "Download is starting" in str(e) or "NS_BINDING_ABORTED" in str(
+                e
+            ):  # Expected
                 response = None  # expected: navigation turned straight into a download
             else:  # Some other, real error
                 raise  # Let the calling code handle it
@@ -940,7 +1103,7 @@ def start_chromium_download(
         )  # Moment when we give up waiting
         while (
             not received and time.time() < deadline
-        ):  # Wait for Chromium to report the download
+        ):  # Wait for the browser to report the download
             page.wait_for_timeout(
                 200
             )  # Wait a moment while Playwright processes browser events
@@ -951,7 +1114,7 @@ def start_chromium_download(
         )  # Hand back what we got
     finally:  # Always runs, even after an error
         page.remove_listener(
-            "download", received.append
+            "download", collect_download
         )  # Stop listening for downloads
 
 
@@ -961,6 +1124,7 @@ def download_pdf_urls(
     urls: list,
     stats: dict,
     internet: "InternetMonitor",
+    activity_page: Page,  # The results tab, where the mouse and keyboard activity happens
 ) -> None:  # Download a batch of URLs
     """Download each URL in turn on the given (temporary) tab."""
     made_a_request = (
@@ -983,17 +1147,20 @@ def download_pdf_urls(
             continue  # Move on to the next URL
 
         if made_a_request:  # Only pause between two real requests
-            pause_like_a_person(
-                *PAUSE_BETWEEN_DOWNLOADS, "between downloads"
-            )  # Random short pause
+            activity_page.bring_to_front()  # Show the results tab, a hidden tab would look odd to the website
+            pause_while_acting_like_a_person(
+                activity_page, *PAUSE_BETWEEN_DOWNLOADS, "between downloads"
+            )  # Move the mouse, scroll and press random letters instead of sitting still
         made_a_request = True  # From now on we've contacted the website
 
         try:  # Starting a download can raise browser errors
-            download, outcome = start_chromium_download(
+            download, outcome = start_download(
                 page, source_url
-            )  # Let Chromium download it
+            )  # Let the browser download it
         except PlaywrightError as e:  # A real browser error happened
-            if is_browser_closed_error(e):  # Check whether Chromium itself has closed
+            if is_browser_closed_error(
+                e
+            ):  # Check whether the browser itself has closed
                 raise  # Let the restart logic deal with it, this URL stays pending
             if (
                 internet.confirm_down()
@@ -1040,7 +1207,7 @@ def download_pdf_urls(
                 stats
             )  # The website answered normally, so the blocks-in-a-row count restarts
             continue  # Move on to the next URL
-        if download is None:  # Chromium never produced a download
+        if download is None:  # The browser never produced a download
             if (
                 internet.confirm_down()
             ):  # Check whether the internet being down is the reason
@@ -1066,14 +1233,14 @@ def download_pdf_urls(
 def _finish_download(
     download: Download, source_url: str, db: DownloadDatabase, stats: dict
 ) -> None:  # Validate and save a completed download
-    """Validate, name, de-duplicate and save a download that Chromium already started."""
+    """Validate, name, de-duplicate and save a download that the browser already started."""
     suggested_name = (
         download.suggested_filename
-    )  # The file name Chromium would have used
+    )  # The file name the browser would have used
     failure = download.failure()  # Wait for the download to end and get any error
-    if failure:  # Chromium reported that the download failed
+    if failure:  # The browser reported that the download failed
         logger.error(
-            "  FAILED: Chromium download error '%s' for %s", failure, source_url
+            "  FAILED: browser download error '%s' for %s", failure, source_url
         )  # Log
         stats["failed"] += 1  # Count the failure
         return  # Stop here, nothing more to do
@@ -1133,7 +1300,12 @@ def download_pdf_urls_in_temporary_tab(
     session.internet_monitor.raise_if_down()  # Don't open a tab while the internet is down
     with session.temporary_download_tab() as download_page:  # Open the second tab and close it afterwards
         download_pdf_urls(
-            download_page, db, needs_download, stats, session.internet_monitor
+            download_page,
+            db,
+            needs_download,
+            stats,
+            session.internet_monitor,
+            session.results_page,
         )  # Download the missing files
 
 
@@ -1163,6 +1335,9 @@ def collect_and_download_pdf_urls_for_keyword(
         )  # Explain the skip
         return  # Nothing was collected, so go on to the next keyword
     dismiss_cookie_banner(page)  # Close the cookie popup if present
+    pause_while_acting_like_a_person(
+        page, *ACTIVITY_AFTER_OPENING_SEARCH_PAGE, "after opening the search page"
+    )  # Move the mouse, scroll and press random letters before reading the results
 
     all_urls = set()  # Collects the URLs from every result page of this keyword
     for page_number in range(
@@ -1171,6 +1346,10 @@ def collect_and_download_pdf_urls_for_keyword(
         session.close_unneeded_tabs()  # Close any tab other than the results and download tabs
         session.internet_monitor.raise_if_down()  # Stop here and wait if the internet is down
         page.bring_to_front()  # Keep the results tab in front
+        if page_number > 1:  # A next result page has just opened
+            pause_while_acting_like_a_person(
+                page, *ACTIVITY_AFTER_OPENING_SEARCH_PAGE, "after opening a result page"
+            )  # Move the mouse, scroll and press random letters before reading the results
         scroll_to_bottom_of_page(page)  # Make sure all results on this page are loaded
 
         urls_here = extract_pdf_urls_from_page(page)  # Read the URLs from this page
@@ -1206,9 +1385,9 @@ def collect_and_download_pdf_urls_for_keyword(
             )  # Explain why we stop
             break  # Stop, we're probably seeing the same page again
 
-        pause_like_a_person(
-            *PAUSE_BETWEEN_RESULT_PAGES, "before the next result page"
-        )  # Random short pause
+        pause_while_acting_like_a_person(
+            page, *PAUSE_BETWEEN_RESULT_PAGES, "before the next result page"
+        )  # Move the mouse, scroll and press random letters instead of sitting still
         page.bring_to_front()  # Return to the results tab before looking for the next page button
         if not click_next_page_button(page):  # Try to go to the next page
             break  # There's no next page, so this keyword is finished
@@ -1282,8 +1461,8 @@ def check_internet_connection() -> bool:  # The internet works when at least one
     )  # One answer is enough
 
 
-class InternetMonitor:  # Checks the internet in a background thread and closes Chromium when it goes down
-    """Watches the internet in a background thread and closes Chromium on outage."""
+class InternetMonitor:  # Checks the internet in a background thread and tells the session when it goes down
+    """Watches the internet in a background thread and flags the browser for restarting on outage."""
 
     def __init__(self):  # Prepare the shared state
         self.available = threading.Event()  # Set while the internet works
@@ -1291,20 +1470,18 @@ class InternetMonitor:  # Checks the internet in a background thread and closes 
         self.lock = (
             threading.Lock()
         )  # Prevents two threads from changing the state at the same time
-        self.outage_close_function = (
-            None  # Function that closes Chromium when the internet goes down
+        self.outage_function = (
+            None  # Function that is called when the internet goes down
         )
         self.outage_occurred = (
-            False  # True when Chromium was closed because of an outage
+            False  # True when the browser must be restarted because of an outage
         )
         self.thread = None  # The background thread
 
     def start(
-        self, outage_close_function
+        self, outage_function
     ) -> None:  # Do a first check and start the background thread
-        self.outage_close_function = (
-            outage_close_function  # Remember how to close Chromium
-        )
+        self.outage_function = outage_function  # Remember what to call on an outage
         if check_internet_connection():  # First check, done right now
             self.available.set()  # The internet works
             logger.info("Internet check: the internet is working")  # Record it
@@ -1334,7 +1511,7 @@ class InternetMonitor:  # Checks the internet in a background thread and closes 
     def update_state(
         self, internet_works: bool
     ) -> None:  # React when the internet goes down or comes back
-        should_close = False  # Becomes True when the internet has just gone down
+        went_down = False  # Becomes True when the internet has just gone down
         with self.lock:  # Only one thread may change the state at a time
             was_available = self.available.is_set()  # What we believed until now
             if internet_works and not was_available:  # The internet came back
@@ -1343,23 +1520,25 @@ class InternetMonitor:  # Checks the internet in a background thread and closes 
             elif not internet_works and was_available:  # The internet just went down
                 self.available.clear()  # Record that it doesn't work
                 self.outage_occurred = (
-                    True  # Remember that Chromium must be restarted afterwards
+                    True  # Remember that the browser must be restarted afterwards
                 )
-                should_close = True  # Chromium has to be closed
+                went_down = True  # The outage function has to be called
                 logger.error("INTERNET IS DOWN")  # Tell the user
         if (
-            should_close and self.outage_close_function
-        ):  # Close Chromium outside the lock
-            try:  # Closing can fail
-                self.outage_close_function()  # Close Chromium
+            went_down and self.outage_function
+        ):  # Call the outage function outside the lock
+            try:  # Calling it can fail
+                self.outage_function()  # Handle the outage
             except Exception:  # Anything unexpected
                 logger.exception(
-                    "Could not close Chromium after the internet went down"
+                    "Could not handle the internet outage"
                 )  # Log the details
 
     def confirm_down(self) -> bool:  # Check right now whether the internet is down
         works = check_internet_connection()  # Do a live check
-        self.update_state(works)  # Update the shared state and close Chromium if needed
+        self.update_state(
+            works
+        )  # Update the shared state and handle the outage if needed
         return not works  # True when the internet is down
 
     def raise_if_down(self) -> None:  # Cheap check used before every request
@@ -1401,12 +1580,12 @@ BROWSER_CLOSED_MESSAGES = (
     "browser closed",
     "connection closed",
     "browser has disconnected",
-)  # Known "Chromium is gone" phrases
+)  # Known "browser is gone" phrases
 
 
 def is_browser_closed_error(
     error: Exception,
-) -> bool:  # Check whether an error means Chromium is gone
+) -> bool:  # Check whether an error means the browser is gone
     text = str(
         error
     ).lower()  # Lowercase the error text so the comparison ignores capitals
@@ -1415,94 +1594,42 @@ def is_browser_closed_error(
     )  # True if any known phrase matches
 
 
-class BrowserSession:  # Owns Chromium and both tabs; can restart everything if Chromium closes or crashes
-    """Owns Chromium and both tabs; can restart everything if Chromium closes or crashes."""
+class BrowserSession:  # Owns the browser and both tabs; can restart everything if the browser closes or crashes
+    """Owns the browser and both tabs; can restart everything if the browser closes or crashes."""
 
     def __init__(
         self,
-        playwright_instance,
-        chromium_executable_path: str,
         internet_monitor: InternetMonitor,
     ):  # Setup
         self.internet_monitor = internet_monitor  # Tells us whether the internet works
-        self.use_no_sandbox = (
-            False  # Becomes True once we learn this system blocks Chromium's sandbox
-        )
         self.download_page: Optional[
             Page
         ] = None  # The temporary download tab, only set while it's open
         self.is_opening_download_tab = (
             False  # True for a moment while we open the download tab ourselves
         )
-        self.playwright_instance = playwright_instance  # The running Playwright
-        self.chromium_executable_path = (
-            chromium_executable_path  # Where Chromium is installed
-        )
-        self.chromium_process: Optional[
-            subprocess.Popen
-        ] = None  # The Chromium program, once started
-        self.connected_browser = None  # Playwright's connection to Chromium
+        self.invisible_playwright: Optional[
+            InvisiblePlaywright
+        ] = None  # The invisible_playwright launcher, once started
+        self.connected_browser = None  # The Playwright Browser object
+        self.context = None  # The browser context that owns both tabs
         self.results_page: Optional[
             Page
         ] = None  # Tab used for browsing the search results
-        self.restart_count = 0  # How many times Chromium had to be restarted
+        self.restart_count = 0  # How many times the browser had to be restarted
 
-    def start(self) -> None:  # Start Chromium and open both tabs
-        self.chromium_process = start_chromium_process(
-            self.chromium_executable_path, self.use_no_sandbox
-        )  # Start it
-        endpoint = wait_for_chromium_debugging_endpoint(
-            self.chromium_process
-        )  # Wait until Chromium is ready
-
-        if endpoint is None and chromium_failed_because_of_sandbox(
-            self.chromium_process
-        ):  # The sandbox is the problem
-            if (
-                not CHROMIUM_DISABLE_SANDBOX_IF_NEEDED
-            ):  # The user doesn't allow starting without the sandbox
-                stop_chromium_process(
-                    self.chromium_process
-                )  # Make sure nothing is left running
-                raise RuntimeError(
-                    "Chromium cannot use its sandbox here. Allow user namespaces or set CHROMIUM_DISABLE_SANDBOX_IF_NEEDED = True"
-                )  # Stop
-            logger.warning(
-                "Chromium cannot use its sandbox here, restarting with --no-sandbox"
-            )  # Explain
-            stop_chromium_process(
-                self.chromium_process
-            )  # Make sure the failed process is gone
-            self.use_no_sandbox = True  # Remember this choice for every later start
-            self.chromium_process = start_chromium_process(
-                self.chromium_executable_path, True
-            )  # Start it again
-            endpoint = wait_for_chromium_debugging_endpoint(
-                self.chromium_process
-            )  # Wait until it's ready
-
-        if endpoint is None:  # Chromium didn't become ready
-            stop_chromium_process(
-                self.chromium_process
-            )  # Don't leave a stuck Chromium behind
-            raise RuntimeError(
-                "Chromium did not become ready; see CHROMIUM OUTPUT above"
-            )  # Stop
-
-        logger.info("Connecting Playwright to the running Chromium")  # Record it
-        self.connected_browser = self.playwright_instance.chromium.connect_over_cdp(
-            endpoint
-        )  # Attach directly
-        context = self.connected_browser.contexts[
-            0
-        ]  # Use Chromium's normal browsing context
-
-        tabs = list(context.pages)  # The tabs Chromium opened by itself
-        self.results_page = (
-            tabs[0] if tabs else context.new_page()
-        )  # Use the first tab, or open one if there's none
-        for extra in tabs[1:]:  # Every further tab is not needed
-            self._close_quietly(extra)  # Close it
+    def start(self) -> None:  # Start the browser and open the results tab
+        logger.info("Starting the browser through invisible_playwright")  # Record it
+        self.invisible_playwright = InvisiblePlaywright(
+            extra_prefs={"pdfjs.disabled": True}
+        )  # Prepare the launcher; without this Firefox shows PDFs in its viewer instead of downloading them
+        self.connected_browser = (
+            self.invisible_playwright.__enter__()
+        )  # Launch the browser
+        self.context = (
+            self.connected_browser.new_context()
+        )  # The context both tabs live in
+        self.results_page = self.context.new_page()  # Open the first tab
 
         self.results_page.set_default_timeout(
             NAVIGATION_TIMEOUT_MS
@@ -1510,7 +1637,7 @@ class BrowserSession:  # Owns Chromium and both tabs; can restart everything if 
         attach_browser_event_logging(
             self.results_page
         )  # Start logging everything the results tab does
-        context.on(
+        self.context.on(
             "page", self._close_unexpected_new_tab
         )  # Close any popup or extra tab the moment it opens
         self.results_page.bring_to_front()  # Show the results tab
@@ -1540,10 +1667,7 @@ class BrowserSession:  # Owns Chromium and both tabs; can restart everything if 
     def close_unneeded_tabs(
         self,
     ) -> None:  # Close every tab except the results tab and the download tab
-        context = self.connected_browser.contexts[
-            0
-        ]  # Chromium's normal browsing context
-        for tab in list(context.pages):  # Look at every open tab
+        for tab in list(self.context.pages):  # Look at every open tab
             if tab not in (
                 self.results_page,
                 self.download_page,
@@ -1553,25 +1677,33 @@ class BrowserSession:  # Owns Chromium and both tabs; can restart everything if 
                 )  # Record which tab is closed
                 self._close_quietly(tab)  # Close it
 
-    def close_chromium_for_outage(
+    def handle_internet_outage(
         self,
-    ) -> None:  # Close Chromium because the internet is down (runs in the monitor thread)
-        logger.error("Closing Chromium because the internet is down")  # Record it
-        stop_chromium_process(self.chromium_process)  # Close the Chromium program
+    ) -> None:  # Called by the monitor thread when the internet goes down
+        # Playwright's sync API must only be used from the thread that started it,
+        # so the monitor thread cannot close the browser itself. The main thread
+        # sees the outage at its next step (raise_if_down) and restart() closes it.
+        logger.error(
+            "The internet is down: the browser will be closed and restarted by the main thread"
+        )  # Record it
 
     @contextmanager  # Turns the method below into something that can be used in a "with" block
     def temporary_download_tab(
         self,
     ) -> Iterator[Page]:  # Open a second tab only while downloads need it
-        context = self.connected_browser.contexts[
-            0
-        ]  # Chromium's normal browsing context
         logger.info("Opening a temporary second tab for downloading")  # Record it
         self.is_opening_download_tab = (
             True  # Tell the popup guard that this new tab is wanted
         )
         try:  # Make sure the flag is always reset
-            download_page = context.new_page()  # Open the second tab
+            with self.context.expect_page(
+                timeout=NAVIGATION_TIMEOUT_MS
+            ) as new_tab_info:  # Wait for the new tab to appear
+                self.results_page.evaluate(
+                    "() => { window.open('about:blank', '_blank'); }"
+                )  # Firefox opens this as a tab in the same window (context.new_page() opens a new window)
+            download_page = new_tab_info.value  # The second tab
+            self.results_page.bring_to_front()  # Keep showing the results tab, downloads work from the background tab
         finally:  # Always runs
             self.is_opening_download_tab = (
                 False  # The popup guard may close unexpected tabs again
@@ -1591,25 +1723,31 @@ class BrowserSession:  # Owns Chromium and both tabs; can restart everything if 
         finally:  # Always runs, even after an error
             self.download_page = None  # The download tab is going away
             logger.info("Closing the temporary download tab")  # Record it
-            try:  # Closing can fail if Chromium itself is gone
+            try:  # Closing can fail if the browser itself is gone
                 download_page.close()  # Close the second tab
                 self.results_page.bring_to_front()  # Show the results tab again
             except PlaywrightError:  # The tab or browser was already gone
                 pass  # Nothing more to do
 
-    def stop(self) -> None:  # Disconnect Playwright and close Chromium
-        if self.connected_browser is not None:  # Check whether we're connected
-            try:  # The connection may already be dead
-                self.connected_browser.close()  # Disconnect Playwright from Chromium
-            except PlaywrightError:  # Chromium was already gone
-                pass  # Nothing more to do
-        stop_chromium_process(
-            self.chromium_process
-        )  # Close the Chromium program if it's still running
+    def stop(self) -> None:  # Close the browser
+        if self.invisible_playwright is not None:  # Check whether a browser was started
+            try:  # The browser may already be dead
+                self.invisible_playwright.__exit__(
+                    None, None, None
+                )  # Close the browser
+            except Exception as e:  # Anything raised by a browser that is already gone
+                logger.debug(
+                    "Ignoring error while closing the browser: %s", e
+                )  # Record it
+        self.invisible_playwright = None  # Forget the old launcher
+        self.connected_browser = None  # Forget the old browser
+        self.context = None  # Forget the old context
+        self.results_page = None  # Forget the old tab
+        self.download_page = None  # Forget the old download tab
 
     def restart(
         self,
-    ) -> None:  # Start a fresh Chromium after the old one closed or crashed
+    ) -> None:  # Start a fresh browser after the old one closed or crashed
         if (
             self.internet_monitor.consume_outage_flag()
         ):  # Check whether this restart is only because the internet was down
@@ -1622,21 +1760,17 @@ class BrowserSession:  # Owns Chromium and both tabs; can restart everything if 
                 self.restart_count > MAX_BROWSER_RESTARTS
             ):  # Check whether we've restarted too often
                 raise RuntimeError(
-                    f"Chromium closed more than {MAX_BROWSER_RESTARTS} times, giving up"
+                    f"The browser closed more than {MAX_BROWSER_RESTARTS} times, giving up"
                 )  # Stop the run
-        exit_code = (
-            self.chromium_process.poll() if self.chromium_process else None
-        )  # How Chromium ended
         logger.error(
-            "Chromium problem detected (exit code %s). Restarting (%d/%d)",
-            exit_code,
+            "Browser problem detected. Restarting (%d/%d)",
             self.restart_count,
             MAX_BROWSER_RESTARTS,
         )  # Record it
-        self.stop()  # Close whatever is left of the old Chromium
-        self.internet_monitor.wait_until_available()  # Don't start Chromium until the internet works
-        time.sleep(3)  # Give the system a moment to free the debugging port
-        self.start()  # Start a fresh Chromium with two new tabs
+        self.stop()  # Close whatever is left of the old browser
+        self.internet_monitor.wait_until_available()  # Don't start the browser until the internet works
+        time.sleep(3)  # Give the system a moment to free resources
+        self.start()  # Start a fresh browser with a new results tab
         warm_up_session_on_home_page(
             self.results_page
         )  # Visit the home page again to refresh the session
@@ -1644,21 +1778,23 @@ class BrowserSession:  # Owns Chromium and both tabs; can restart everything if 
 
 def run_with_browser_restarts(
     session: BrowserSession, description: str, step
-) -> None:  # Run a step, restarting Chromium if needed
-    """Run a step, transparently restarting Chromium (and retrying) on crash or internet outage."""
+) -> None:  # Run a step, restarting the browser if needed
+    """Run a step, transparently restarting the browser (and retrying) on crash or internet outage."""
     while True:  # Keep trying until the step finishes or we give up
-        try:  # The step may fail if Chromium closes
+        try:  # The step may fail if the browser closes
             step()  # Run the step
             return  # The step finished, so we're done
         except InternetOutageError as e:  # The internet went down
             logger.warning("Internet outage during %s: %s", description, e)  # Record it
-            session.restart()  # Wait for the internet, then start a fresh Chromium
+            session.restart()  # Wait for the internet, then start a fresh browser
         except PlaywrightError as e:  # A browser error happened
-            if is_browser_closed_error(e):  # Check whether Chromium or its tab closed
+            if is_browser_closed_error(
+                e
+            ):  # Check whether the browser or its tab closed
                 logger.error(
-                    "Chromium closed during %s: %s", description, str(e).splitlines()[0]
+                    "Browser closed during %s: %s", description, str(e).splitlines()[0]
                 )  # Log
-                session.restart()  # Start a new Chromium, which raises an error if restarts ran out
+                session.restart()  # Start a new browser, which raises an error if restarts ran out
             elif (
                 session.internet_monitor.confirm_down()
             ):  # Check whether the internet being down is the cause
@@ -1666,7 +1802,7 @@ def run_with_browser_restarts(
                     "The internet is down, so the error during %s is expected",
                     description,
                 )  # Say so
-                session.restart()  # Wait for the internet, then start a fresh Chromium
+                session.restart()  # Wait for the internet, then start a fresh browser
             else:  # Some other, real browser error
                 logger.exception(
                     "Browser error during %s, skipping this step", description
@@ -1691,9 +1827,6 @@ def run_downloader() -> None:  # Run the whole job from start to finish
     )  # Remember PDFs that are already in the folder
     db.ignore_non_usa_english_urls()  # Skip old pending URLs that aren't USA English
 
-    prepare_chromium_profile_preferences()  # Make Chromium download PDFs instead of previewing them
-    allow_local_connections_without_proxy()  # Never send the local Chromium connection through a proxy
-
     stats = {
         "downloaded": 0,
         "skipped": 0,
@@ -1703,53 +1836,49 @@ def run_downloader() -> None:  # Run the whole job from start to finish
     }  # Running totals for the whole run
 
     try:  # Make sure the database is closed even if something fails
-        with sync_playwright() as playwright_instance:  # Start Playwright
-            chromium_path = find_chromium_executable_path(
-                playwright_instance
-            )  # Find Playwright's Chromium
-            internet = InternetMonitor()  # Prepare the background internet check
-            session = BrowserSession(
-                playwright_instance, chromium_path, internet
-            )  # Build the browser session
-            try:  # Make sure the monitor and Chromium are always stopped at the end
-                internet.start(
-                    session.close_chromium_for_outage
-                )  # Check the internet in the background
-                internet.wait_until_available()  # Don't start Chromium while the internet is down
-                session.start()  # Start Chromium with a single results tab
-                if not warm_up_session_on_home_page(
-                    session.results_page
-                ):  # Visit the home page first
-                    logger.warning(
-                        "Warm-up did not finish cleanly, continuing anyway"
-                    )  # Record the problem
+        internet = InternetMonitor()  # Prepare the background internet check
+        session = BrowserSession(internet)  # Build the browser session
+        try:  # Make sure the monitor and the browser are always stopped at the end
+            internet.start(
+                session.handle_internet_outage
+            )  # Check the internet in the background
+            internet.wait_until_available()  # Don't start the browser while the internet is down
+            session.start()  # Start the browser with a single results tab
+            if not warm_up_session_on_home_page(
+                session.results_page
+            ):  # Visit the home page and browse around first
+                logger.warning(
+                    "Warm-up did not finish cleanly, continuing anyway"
+                )  # Record the problem
 
-                for i, keyword in enumerate(
-                    SEARCH_KEYWORDS, start=1
-                ):  # Go through a-z and 0-9
-                    if i > 1:  # Only pause between two keywords
-                        pause_like_a_person(
-                            *PAUSE_BETWEEN_KEYWORDS, "before the next keyword"
-                        )  # Pause
-                    run_with_browser_restarts(  # Run the keyword, restarting Chromium if it closes
-                        session,
-                        f"keyword '{keyword}'",  # The session and a description for log messages
-                        lambda kw=keyword: collect_and_download_pdf_urls_for_keyword(
-                            session, db, kw, stats
-                        ),  # The work to do for this keyword
-                    )  # End of the restart wrapper
-
-                logger.info("Retrying URLs that are still pending")  # Record the retry
-                run_with_browser_restarts(  # Retry pending URLs, restarting Chromium if it closes
+            for i, keyword in enumerate(
+                SEARCH_KEYWORDS, start=1
+            ):  # Go through a-z and 0-9
+                if i > 1:  # Only pause between two keywords
+                    pause_while_acting_like_a_person(
+                        session.results_page,
+                        *PAUSE_BETWEEN_KEYWORDS,
+                        "before the next keyword",
+                    )  # Move the mouse, scroll and press random letters instead of sitting still
+                run_with_browser_restarts(  # Run the keyword, restarting the browser if it closes
                     session,
-                    "the retry of pending URLs",  # The session and a description for log messages
-                    lambda: download_pdf_urls_in_temporary_tab(
-                        session, db, db.load_unprocessed_urls(), stats
-                    ),  # The retry work, re-reading pending URLs each attempt
+                    f"keyword '{keyword}'",  # The session and a description for log messages
+                    lambda kw=keyword: collect_and_download_pdf_urls_for_keyword(
+                        session, db, kw, stats
+                    ),  # The work to do for this keyword
                 )  # End of the restart wrapper
-            finally:  # Always runs, even after an error
-                internet.stop()  # Stop the background internet check
-                session.stop()  # Disconnect Playwright and close Chromium
+
+            logger.info("Retrying URLs that are still pending")  # Record the retry
+            run_with_browser_restarts(  # Retry pending URLs, restarting the browser if it closes
+                session,
+                "the retry of pending URLs",  # The session and a description for log messages
+                lambda: download_pdf_urls_in_temporary_tab(
+                    session, db, db.load_unprocessed_urls(), stats
+                ),  # The retry work, re-reading pending URLs each attempt
+            )  # End of the restart wrapper
+        finally:  # Always runs, even after an error
+            internet.stop()  # Stop the background internet check
+            session.stop()  # Close the browser
     except AccessBlockedError as e:  # The website blocked us too many times in a row
         logger.error("STOPPED EARLY: %s", e)  # Explain why the run ended
     except Exception:  # Anything unexpected that escaped the code above
