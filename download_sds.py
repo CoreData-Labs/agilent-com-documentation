@@ -1,13 +1,20 @@
 #!/usr/bin/env python3
 # Agilent SDS downloader.
 #
-# Downloads every USA English Safety Data Sheet PDF found on Agilent's chemical-standards search page.
+# Downloads the Safety Data Sheet PDFs found on Agilent's chemical-standards search page.
+# Every document can exist in several regional versions; exactly ONE version is downloaded per document:
+#   1. _NAEnglish.pdf is the default and is always preferred.
+#   2. If it is not available, _NACanada.pdf is downloaded instead.
+#   3. If neither is available, one of _Australia.pdf, _EUEnglish.pdf, _MalayEnglish.pdf or _UKEnglish.pdf is used.
+#   4. If none of these versions exists, the document is skipped. Any other file format is ignored.
 # The browser is controlled through invisible_playwright (Playwright on an anti-detect Firefox).
 #
 # How the script works:
 #   * It starts one browser window at 1920x1080 with a single "results" tab.
 #   * It visits the home page and a few other pages first, behaving like an ordinary visitor.
 #   * It then searches the keywords a-z and 0-9, one after another.
+#   * A default (_NAEnglish) version is downloaded as soon as it is found. Fallback versions wait until every
+#     keyword has been searched, so a better version found on a later page is never missed.
 #   * After each page of results it downloads the PDFs found there, using a short-lived second tab
 #     that is opened only when something needs downloading and closed right afterwards.
 #   * Only the results tab is ever kept open; popups, extra tabs and extra windows are closed at once.
@@ -71,10 +78,25 @@ HOME_PAGE_BROWSING_SECONDS = (
 )
 OTHER_PAGES_TO_VISIT = 3  # How many other pages are opened from the home page
 OTHER_PAGE_BROWSING_SECONDS = 30  # How long to stay on each of those pages
-REQUIRED_USA_ENGLISH_FILE_NAME_ENDING = "_NAEnglish.pdf"  # Only files whose name ends like this (USA English) are downloaded
+DEFAULT_VERSION_SUFFIX = (
+    "_NAEnglish.pdf"  # The preferred version of every document (USA English)
+)
+FIRST_FALLBACK_VERSION_SUFFIX = (
+    "_NACanada.pdf"  # Used only when the default version is not available
+)
+OTHER_VERSION_SUFFIXES = (
+    "_Australia.pdf",
+    "_EUEnglish.pdf",
+    "_MalayEnglish.pdf",
+    "_UKEnglish.pdf",
+)  # Used only when neither version above is available; tried in this order
+ALLOWED_VERSION_SUFFIXES_BEST_FIRST = (
+    DEFAULT_VERSION_SUFFIX,
+    FIRST_FALLBACK_VERSION_SUFFIX,
+) + OTHER_VERSION_SUFFIXES  # Every format that may be downloaded, best first; all other formats are ignored
 
-BROWSER_WINDOW_WIDTH_PIXELS = 2400  # Browser window width in pixels (full HD)
-BROWSER_WINDOW_HEIGHT_PIXELS = 1350  # Browser window height in pixels (full HD)
+BROWSER_WINDOW_WIDTH_PIXELS = 1920  # Browser window width in pixels (full HD)
+BROWSER_WINDOW_HEIGHT_PIXELS = 1080  # Browser window height in pixels (full HD)
 
 DOWNLOAD_FOLDER = Path("PDFs").resolve()  # Full path of the folder where PDFs are saved
 DATABASE_FILE_PATH = Path(
@@ -147,9 +169,18 @@ def validate_settings() -> None:  # Stop immediately if a setting above is obvio
     assert (
         BROWSER_WINDOW_WIDTH_PIXELS > 0 and BROWSER_WINDOW_HEIGHT_PIXELS > 0
     ), "The browser window size must be positive"  # A window needs a real size
-    assert REQUIRED_USA_ENGLISH_FILE_NAME_ENDING.lower().endswith(
-        ".pdf"
-    ), "REQUIRED_USA_ENGLISH_FILE_NAME_ENDING must end with .pdf"  # We only download PDF files
+    assert all(
+        version_suffix.lower().endswith(".pdf")
+        for version_suffix in ALLOWED_VERSION_SUFFIXES_BEST_FIRST
+    ), "Every version suffix must end with .pdf"  # We only download PDF files
+    assert len(
+        {
+            version_suffix.lower()
+            for version_suffix in ALLOWED_VERSION_SUFFIXES_BEST_FIRST
+        }
+    ) == len(
+        ALLOWED_VERSION_SUFFIXES_BEST_FIRST
+    ), "The version suffixes must all be different"  # A suffix listed twice would be ambiguous
     for pause_range in (
         PAUSE_SECONDS_RANGE_BETWEEN_RESULT_PAGES,
         PAUSE_SECONDS_RANGE_BETWEEN_DOWNLOADS,
@@ -357,24 +388,24 @@ class DownloadDatabase:  # Wraps the SQLite connection and every query this scri
             pdf_folder,
         )  # Report the result
 
-    def ignore_urls_that_are_not_usa_english(
+    def ignore_urls_in_unwanted_formats(
         self,
-    ) -> None:  # Drop old pending URLs we no longer want
-        """Mark pending URLs that fail the language filter as done (for example after a settings change)."""  # Short description
+    ) -> None:  # Drop old pending URLs whose format we never download
+        """Mark pending URLs that are not in one of the wanted formats as done (for example after a settings change)."""  # Short description
         pending_urls = self.load_unprocessed_urls()  # Every URL that is still waiting
         ignored_urls = [
             pending_url
             for pending_url in pending_urls
-            if not is_usa_english_pdf_url(pending_url)
-        ]  # Keep the ones that fail the filter
+            if not is_wanted_version_pdf_url(pending_url)
+        ]  # Keep the ones in an unwanted format
         for ignored_url in ignored_urls:  # Go through each URL that should be ignored
             self.mark_url_processed(
                 ignored_url
             )  # Mark it as done so it is never downloaded
         download_logger.info(
-            "Ignored %d pending URL(s) that do not end in %s",
+            "Ignored %d pending URL(s) that are not in one of the %d wanted formats",
             len(ignored_urls),
-            REQUIRED_USA_ENGLISH_FILE_NAME_ENDING,
+            len(ALLOWED_VERSION_SUFFIXES_BEST_FIRST),
         )  # Report the result
 
     def save_newly_found_urls(self, found_urls: set) -> None:  # Store newly found URLs
@@ -463,6 +494,23 @@ class DownloadDatabase:  # Wraps the SQLite connection and every query this scri
             or (DOWNLOAD_FOLDER / safe_file_name).exists()
         )  # Known in the database or already on disk
 
+    def is_any_version_of_document_saved(
+        self, document_key: str
+    ) -> bool:  # Check whether a file for this document was already saved, in any wanted format
+        """A document is finished as soon as one of its wanted versions has been saved."""  # Short description
+        for (
+            version_suffix
+        ) in ALLOWED_VERSION_SUFFIXES_BEST_FIRST:  # Check every wanted format
+            possible_file_name = build_safe_file_name(
+                document_key + version_suffix
+            )  # The name this version would be saved under
+            if (
+                self.is_file_name_already_saved(possible_file_name)
+                or (DOWNLOAD_FOLDER / possible_file_name).exists()
+            ):  # Known in the database or already on disk
+                return True  # One version is enough
+        return False  # No version of this document has been saved yet
+
 
 # ============================================================== FILE NAMES
 
@@ -478,14 +526,78 @@ def guess_file_name_from_url(
     )  # Only trust names that really end in .pdf
 
 
-def is_usa_english_pdf_url(
+def find_version_suffix_in_url(
     source_url: str,
-) -> bool:  # Check whether a URL points to a USA English file
+) -> Optional[str]:  # Work out which wanted format (if any) a PDF address is in
+    lowercase_path = unquote(
+        urlparse(source_url).path
+    ).lower()  # The address path in lowercase, with %20-style codes decoded
+    for (
+        version_suffix
+    ) in ALLOWED_VERSION_SUFFIXES_BEST_FIRST:  # Check the wanted formats one by one
+        if lowercase_path.endswith(
+            version_suffix.lower()
+        ):  # The address ends with this format
+            return version_suffix  # Found the format
+    return None  # The address is not in any wanted format, so it is ignored
+
+
+def is_wanted_version_pdf_url(
+    source_url: str,
+) -> bool:  # True when the address is a PDF in one of the wanted formats
     return (
+        find_version_suffix_in_url(source_url) is not None
+    )  # Any wanted format counts
+
+
+def get_document_key_from_url(
+    source_url: str,
+) -> str:  # The file name without its format ending; every version of a document shares it
+    version_suffix = (
+        find_version_suffix_in_url(source_url) or ""
+    )  # The format ending of this address
+    lowercase_file_name = Path(
         unquote(urlparse(source_url).path)
-        .lower()
-        .endswith(REQUIRED_USA_ENGLISH_FILE_NAME_ENDING.lower())
-    )  # True when the path ends in _NAEnglish.pdf
+    ).name.lower()  # The file name in lowercase
+    return lowercase_file_name[
+        : len(lowercase_file_name) - len(version_suffix)
+    ]  # Cut the format ending off
+
+
+def get_version_rank_from_url(
+    source_url: str,
+) -> int:  # 0 is the default version; higher numbers are less preferred
+    version_suffix = find_version_suffix_in_url(
+        source_url
+    )  # The format of this address
+    if version_suffix is None:  # Not a wanted format
+        return len(
+            ALLOWED_VERSION_SUFFIXES_BEST_FIRST
+        )  # Rank it after every wanted format
+    return ALLOWED_VERSION_SUFFIXES_BEST_FIRST.index(
+        version_suffix
+    )  # Its position in the best-first list
+
+
+def group_urls_by_document(
+    source_urls,
+) -> dict:  # Put every version of the same document together, best version first
+    urls_by_document: dict[
+        str, list[str]
+    ] = {}  # Maps a document key to the addresses of its versions
+    for source_url in sorted(
+        set(source_urls)
+    ):  # Go through each distinct address in a stable order
+        if not is_wanted_version_pdf_url(source_url):  # An unwanted format
+            continue  # Ignore it
+        urls_by_document.setdefault(get_document_key_from_url(source_url), []).append(
+            source_url
+        )  # File it under its document
+    for candidate_urls in urls_by_document.values():  # Look at every document
+        candidate_urls.sort(
+            key=get_version_rank_from_url
+        )  # Put the default version first, then the fallbacks in order
+    return urls_by_document  # Give the groups back
 
 
 def build_safe_file_name(
@@ -497,14 +609,27 @@ def build_safe_file_name(
     file_name_stem = re.sub(
         r"[^a-z0-9_]+", "_", file_name_stem.lower()
     )  # Lowercase everything and replace odd characters with underscores
-    file_name_stem = re.sub(r"_+", "_", file_name_stem)[
-        :MAXIMUM_FILE_NAME_STEM_LENGTH
+    file_name_stem = re.sub(r"_+", "_", file_name_stem)  # Merge repeated underscores
+    version_ending = ""  # The format ending (such as _naenglish) must never be cut off when a long name is shortened
+    for (
+        version_suffix
+    ) in (
+        ALLOWED_VERSION_SUFFIXES_BEST_FIRST
+    ):  # Check whether the name ends with a wanted format
+        if file_name_stem.endswith(version_suffix[:-4].lower()):  # It does
+            version_ending = version_suffix[:-4].lower()  # Remember the ending
+            break  # No need to look further
+    document_part = file_name_stem[
+        : len(file_name_stem) - len(version_ending)
+    ]  # Everything before the format ending
+    document_part = document_part[
+        : MAXIMUM_FILE_NAME_STEM_LENGTH - len(version_ending)
     ].strip(
         "_"
-    )  # Merge repeated underscores, shorten, and trim the ends
+    )  # Shorten only the document part and trim the ends
     return (
-        file_name_stem or "document"
-    ) + ".pdf"  # Use "document" if nothing is left, then add .pdf again
+        (document_part or "document") + version_ending + ".pdf"
+    )  # Use "document" if nothing is left, then add the ending and .pdf
 
 
 # ============================================================== BLOCK TRACKING
@@ -674,7 +799,7 @@ PDF_URL_INSIDE_PAGE_SOURCE_PATTERN = re.compile(
 
 def extract_pdf_urls_from_page(
     browser_page: Page,
-) -> set:  # Find every USA English PDF address on the page
+) -> set:  # Find every PDF address on the page that is in a wanted format
     found_urls = set()  # Collects the addresses found on this page
     for link_url in browser_page.evaluate(
         "() => Array.from(document.querySelectorAll('a[href]')).map(linkElement => linkElement.href)"
@@ -692,15 +817,13 @@ def extract_pdf_urls_from_page(
         found_urls.add(
             url_found_in_source.replace("\\u0026", "&").replace("&amp;", "&")
         )  # Remember it after decoding escaped ampersands
-    usa_english_urls = {
-        found_url for found_url in found_urls if is_usa_english_pdf_url(found_url)
-    }  # Keep only the USA English files
+    wanted_urls = {
+        found_url for found_url in found_urls if is_wanted_version_pdf_url(found_url)
+    }  # Keep only the wanted formats and ignore all others
     download_logger.debug(
-        "Found %d PDF link(s), %d after the USA English filter",
-        len(found_urls),
-        len(usa_english_urls),
+        "Found %d PDF link(s), %d in a wanted format", len(found_urls), len(wanted_urls)
     )  # Record how many links were found
-    return usa_english_urls  # Give back only the USA English addresses
+    return wanted_urls  # Give back only the addresses in a wanted format
 
 
 NEXT_PAGE_BUTTON_SELECTORS = [  # Different ways the "next page" button might be found
@@ -1382,124 +1505,208 @@ def start_browser_download(
         )  # Stop listening for downloads
 
 
-def download_pdf_files_from_urls(
+URL_RESULT_SAVED = "saved"  # The file was downloaded and saved
+URL_RESULT_FILE_ALREADY_EXISTS = (
+    "file already exists"  # A file with this name was already saved
+)
+URL_RESULT_VERSION_NOT_AVAILABLE = "version not available"  # This version does not exist, so the next best version may be tried
+URL_RESULT_TRY_AGAIN_LATER = "try again later"  # A temporary problem; no lower-priority version may be used instead
+
+
+def mark_versions_as_skipped(
+    download_database: DownloadDatabase,
+    version_urls: list,
+    run_statistics: RunStatistics,
+    reason_text: str,
+) -> None:  # Mark versions as finished without downloading them
+    for version_url in version_urls:  # Go through each version
+        download_logger.info(
+            "  SKIP: %s: %s", reason_text, version_url
+        )  # Explain the skip
+        download_database.mark_url_processed(
+            version_url
+        )  # Never try this version again
+        run_statistics.skipped_count += 1  # Count the skip
+
+
+def download_single_url(
     download_page: Page,
     download_database: DownloadDatabase,
-    urls_to_download: list,
+    source_url: str,
+    run_statistics: RunStatistics,
+    internet_monitor: "InternetMonitor",
+) -> str:  # Download one version and say what happened
+    try:  # Starting a download can raise browser errors
+        started_download, download_outcome = start_browser_download(
+            download_page, source_url
+        )  # Let the browser download the file
+    except PlaywrightError as browser_error:  # A real browser error happened
+        if is_browser_closed_error(
+            browser_error
+        ):  # Check whether the browser itself has closed
+            raise  # Let the restart logic deal with it; this URL stays pending
+        if (
+            internet_monitor.confirm_internet_is_down()
+        ):  # Check whether a lost internet connection caused the error
+            raise InternetOutageError(
+                "The internet went down while downloading"
+            ) from browser_error  # Wait for it; this URL stays pending
+        download_logger.error(
+            "  FAILED to open %s: %s", source_url, str(browser_error).splitlines()[0]
+        )  # Record the failure
+        run_statistics.failed_count += 1  # Count the failure
+        return URL_RESULT_TRY_AGAIN_LATER  # A temporary problem
+
+    if (
+        download_outcome == DOWNLOAD_OUTCOME_PAGE_UNAVAILABLE
+    ):  # The link led to the "page may no longer exist" message
+        download_logger.warning(
+            "  SKIP: page unavailable, no PDF at %s", source_url
+        )  # Explain the skip
+        download_database.mark_url_processed(source_url)  # Never try this URL again
+        run_statistics.unavailable_count += 1  # Count it as unavailable
+        reset_access_blocks(
+            run_statistics
+        )  # The website answered normally, so the blocks-in-a-row count starts again
+        return URL_RESULT_VERSION_NOT_AVAILABLE  # This version does not exist
+    if (
+        download_outcome == DOWNLOAD_OUTCOME_ACCESS_DENIED
+    ):  # The website blocked this request
+        download_logger.error(
+            "  FAILED: access denied for %s", source_url
+        )  # Record the failure
+        run_statistics.failed_count += 1  # Count the failure
+        register_access_block(
+            run_statistics
+        )  # Count the block, which may stop the whole run
+        return URL_RESULT_TRY_AGAIN_LATER  # A temporary problem
+    if (
+        download_outcome == DOWNLOAD_OUTCOME_NOT_A_DOWNLOAD
+    ):  # The link is an ordinary web page, not a PDF
+        download_logger.warning(
+            "  SKIP: the link is a web page, not a PDF: %s", source_url
+        )  # Explain the skip
+        download_database.mark_url_processed(source_url)  # Never try this URL again
+        run_statistics.skipped_count += 1  # Count it as skipped
+        reset_access_blocks(
+            run_statistics
+        )  # The website answered normally, so the blocks-in-a-row count starts again
+        return URL_RESULT_VERSION_NOT_AVAILABLE  # This version is not a real file
+    if started_download is None:  # The browser never produced a download
+        if (
+            internet_monitor.confirm_internet_is_down()
+        ):  # Check whether a lost internet connection is the reason
+            raise InternetOutageError(
+                "The internet went down while downloading"
+            )  # Wait for it; this URL stays pending
+        download_logger.error(
+            "  FAILED: no download (%s) for %s", download_outcome, source_url
+        )  # Record the failure
+        run_statistics.failed_count += 1  # Count the failure
+        return URL_RESULT_TRY_AGAIN_LATER  # A temporary problem
+    reset_access_blocks(
+        run_statistics
+    )  # A download started, so the blocks-in-a-row count starts again
+
+    return check_and_save_finished_download(
+        started_download, source_url, download_database, run_statistics
+    )  # Check, name and save the finished download
+
+
+def download_best_version_of_each_document(
+    download_page: Page,
+    download_database: DownloadDatabase,
+    documents_to_download: dict,
     run_statistics: RunStatistics,
     internet_monitor: "InternetMonitor",
     page_for_mouse_activity: Page,
-) -> None:  # Download a batch of URLs
-    """Download each URL in turn on the temporary tab; mouse and key activity happens on the results tab."""  # Short description
+) -> None:  # Download exactly one version per document
+    """Try the versions of each document best first, stop at the first one that is saved, skip all the others."""  # Short description
     already_contacted_website = (
         False  # Tracks whether we already contacted the website in this batch
     )
-    for url_position, source_url in enumerate(
-        urls_to_download, start=1
-    ):  # Handle each URL one at a time
+    for document_position, (document_key, candidate_urls) in enumerate(
+        documents_to_download.items(), start=1
+    ):  # Handle one document at a time
         download_logger.info(
-            "(%d/%d) Processing %s", url_position, len(urls_to_download), source_url
+            "(%d/%d) Document '%s' has %d version(s) to try, best first",
+            document_position,
+            len(documents_to_download),
+            document_key,
+            len(candidate_urls),
         )  # Record the progress
-        internet_monitor.raise_error_if_internet_is_down()  # Stop here and wait if the internet is down
-
-        if download_database.is_file_for_url_already_downloaded(
-            source_url
-        ):  # Skip the URL when its file already exists
+        for version_position, source_url in enumerate(
+            candidate_urls
+        ):  # Try the versions from best to worst
+            internet_monitor.raise_error_if_internet_is_down()  # Stop here and wait if the internet is down
+            lower_priority_urls = candidate_urls[
+                version_position + 1 :
+            ]  # The versions that are worse than this one
             download_logger.info(
-                "  SKIP: the file for this URL already exists"
-            )  # Explain the skip
-            download_database.mark_url_processed(
-                source_url
-            )  # Remember that this URL is finished
-            run_statistics.skipped_count += 1  # Count the skip
-            continue  # Move on to the next URL
-
-        if already_contacted_website:  # Only pause between two real requests
-            page_for_mouse_activity.bring_to_front()  # Show the results tab, because a hidden tab would look odd to the website
-            pause_while_acting_like_a_human(
-                page_for_mouse_activity,
-                *PAUSE_SECONDS_RANGE_BETWEEN_DOWNLOADS,
-                "between downloads",
-            )  # Move the mouse and scroll instead of sitting still
-        already_contacted_website = True  # From now on we have contacted the website
-
-        try:  # Starting a download can raise browser errors
-            started_download, download_outcome = start_browser_download(
-                download_page, source_url
-            )  # Let the browser download the file
-        except PlaywrightError as browser_error:  # A real browser error happened
-            if is_browser_closed_error(
-                browser_error
-            ):  # Check whether the browser itself has closed
-                raise  # Let the restart logic deal with it; this URL stays pending
-            if (
-                internet_monitor.confirm_internet_is_down()
-            ):  # Check whether a lost internet connection caused the error
-                raise InternetOutageError(
-                    "The internet went down while downloading"
-                ) from browser_error  # Wait for it; this URL stays pending
-            download_logger.error(
-                "  FAILED to open %s: %s",
+                "  Trying version %d of %d: %s",
+                version_position + 1,
+                len(candidate_urls),
                 source_url,
-                str(browser_error).splitlines()[0],
-            )  # Record the failure
-            run_statistics.failed_count += 1  # Count the failure
-            continue  # Move on to the next URL
+            )  # Record the attempt
 
-        if (
-            download_outcome == DOWNLOAD_OUTCOME_PAGE_UNAVAILABLE
-        ):  # The link led to the "page may no longer exist" message
-            download_logger.warning(
-                "  SKIP: page unavailable, no PDF at %s", source_url
-            )  # Explain the skip
-            download_database.mark_url_processed(source_url)  # Never try this URL again
-            run_statistics.unavailable_count += 1  # Count it as unavailable
-            reset_access_blocks(
-                run_statistics
-            )  # The website answered normally, so the blocks-in-a-row count starts again
-            continue  # Move on to the next URL
-        if (
-            download_outcome == DOWNLOAD_OUTCOME_ACCESS_DENIED
-        ):  # The website blocked this request
-            download_logger.error(
-                "  FAILED: access denied for %s", source_url
-            )  # Record the failure
-            run_statistics.failed_count += 1  # Count the failure
-            register_access_block(
-                run_statistics
-            )  # Count the block, which may stop the whole run
-            continue  # Move on to the next URL
-        if (
-            download_outcome == DOWNLOAD_OUTCOME_NOT_A_DOWNLOAD
-        ):  # The link is an ordinary web page, not a PDF
-            download_logger.warning(
-                "  SKIP: the link is a web page, not a PDF: %s", source_url
-            )  # Explain the skip
-            download_database.mark_url_processed(source_url)  # Never try this URL again
-            run_statistics.skipped_count += 1  # Count it as skipped
-            reset_access_blocks(
-                run_statistics
-            )  # The website answered normally, so the blocks-in-a-row count starts again
-            continue  # Move on to the next URL
-        if started_download is None:  # The browser never produced a download
+            if download_database.is_file_for_url_already_downloaded(
+                source_url
+            ):  # The file for this version already exists
+                download_logger.info(
+                    "  SKIP: the file for this URL already exists"
+                )  # Explain the skip
+                download_database.mark_url_processed(
+                    source_url
+                )  # Remember that this URL is finished
+                run_statistics.skipped_count += 1  # Count the skip
+                url_result = URL_RESULT_FILE_ALREADY_EXISTS  # The document is covered
+            else:  # The file still has to be downloaded
+                if already_contacted_website:  # Only pause between two real requests
+                    page_for_mouse_activity.bring_to_front()  # Show the results tab, because a hidden tab would look odd to the website
+                    pause_while_acting_like_a_human(
+                        page_for_mouse_activity,
+                        *PAUSE_SECONDS_RANGE_BETWEEN_DOWNLOADS,
+                        "between downloads",
+                    )  # Move the mouse and scroll instead of sitting still
+                already_contacted_website = (
+                    True  # From now on we have contacted the website
+                )
+                url_result = download_single_url(
+                    download_page,
+                    download_database,
+                    source_url,
+                    run_statistics,
+                    internet_monitor,
+                )  # Download this version
+
+            if url_result in (
+                URL_RESULT_SAVED,
+                URL_RESULT_FILE_ALREADY_EXISTS,
+            ):  # The document now has its file
+                mark_versions_as_skipped(
+                    download_database,
+                    lower_priority_urls,
+                    run_statistics,
+                    "a better version of this document is already saved",
+                )  # Never download the other versions
+                break  # Go on with the next document
             if (
-                internet_monitor.confirm_internet_is_down()
-            ):  # Check whether a lost internet connection is the reason
-                raise InternetOutageError(
-                    "The internet went down while downloading"
-                )  # Wait for it; this URL stays pending
-            download_logger.error(
-                "  FAILED: no download (%s) for %s", download_outcome, source_url
-            )  # Record the failure
-            run_statistics.failed_count += 1  # Count the failure
-            continue  # Move on to the next URL
-        reset_access_blocks(
-            run_statistics
-        )  # A download started, so the blocks-in-a-row count starts again
-
-        check_and_save_finished_download(
-            started_download, source_url, download_database, run_statistics
-        )  # Check, name and save the finished download
+                url_result == URL_RESULT_TRY_AGAIN_LATER
+            ):  # A temporary problem with the best remaining version
+                download_logger.warning(
+                    "  This version will be retried later, so no lower-priority version is downloaded now"
+                )  # Explain why we stop here
+                break  # Leave the other versions pending and go on with the next document
+            if (
+                lower_priority_urls
+            ):  # This version does not exist and there are others to try
+                download_logger.info(
+                    "  This version is not available, trying the next best version"
+                )  # Explain what happens next
+            else:  # That was the last version
+                download_logger.warning(
+                    "  No wanted version of this document could be downloaded, skipping it"
+                )  # Explain that the document is skipped
 
     log_run_statistics(
         run_statistics, "Totals so far"
@@ -1511,7 +1718,7 @@ def check_and_save_finished_download(
     source_url: str,
     download_database: DownloadDatabase,
     run_statistics: RunStatistics,
-) -> None:  # Check and save a completed download
+) -> str:  # Check and save a completed download
     """Check that the file is a real PDF, give it a clean name, skip duplicates, and save it."""  # Short description
     suggested_file_name = (
         started_download.suggested_filename
@@ -1524,7 +1731,7 @@ def check_and_save_finished_download(
             "  FAILED: browser download error '%s' for %s", download_failure, source_url
         )  # Record the failure
         run_statistics.failed_count += 1  # Count the failure
-        return  # Nothing more to do
+        return URL_RESULT_TRY_AGAIN_LATER  # A temporary problem
 
     with open(
         started_download.path(), "rb"
@@ -1532,11 +1739,15 @@ def check_and_save_finished_download(
         file_start_bytes = downloaded_file_handle.read(4)  # Read its first four bytes
     if file_start_bytes != b"%PDF":  # Real PDF files always start with %PDF
         download_logger.error(
-            "  FAILED: downloaded file is not a PDF: %s", source_url
+            "  FAILED: downloaded file is not a PDF, treating this version as unavailable: %s",
+            source_url,
         )  # Record the problem
         started_download.delete()  # Throw the file away
+        download_database.mark_url_processed(
+            source_url
+        )  # A broken file will not fix itself, so stop retrying it
         run_statistics.failed_count += 1  # Count the failure
-        return  # Nothing more to do
+        return URL_RESULT_VERSION_NOT_AVAILABLE  # The next best version may be tried
 
     safe_file_name = build_safe_file_name(
         suggested_file_name
@@ -1556,7 +1767,7 @@ def check_and_save_finished_download(
             source_url
         )  # Remember that this URL is finished
         run_statistics.skipped_count += 1  # Count it as skipped
-        return  # Nothing more to do
+        return URL_RESULT_FILE_ALREADY_EXISTS  # The document already has its file
 
     started_download.save_as(safe_file_path)  # Save the PDF into the PDFs folder
     download_database.record_saved_file(
@@ -1569,44 +1780,88 @@ def check_and_save_finished_download(
     download_logger.info(
         "  SAVED: %s (%d bytes)", safe_file_path, safe_file_path.stat().st_size
     )  # Record the result
+    return URL_RESULT_SAVED  # The document now has its file
 
 
-def download_pdf_files_using_temporary_tab(
+def keep_only_documents_with_default_version(
+    urls_grouped_by_document: dict,
+) -> dict:  # Keep the documents whose best pending version is the default one
+    return {
+        document_key: [candidate_urls[0]]
+        for document_key, candidate_urls in urls_grouped_by_document.items()
+        if candidate_urls and get_version_rank_from_url(candidate_urls[0]) == 0
+    }  # Only the default version is kept for each of them
+
+
+def select_documents_with_default_version(
+    download_database: DownloadDatabase, found_urls: set
+) -> dict:  # Documents that can be downloaded right away because their default version was found
+    pending_urls = download_database.keep_only_unprocessed_urls(
+        sorted(found_urls)
+    )  # Leave out versions that are already finished
+    return keep_only_documents_with_default_version(
+        group_urls_by_document(pending_urls)
+    )  # Only documents with a pending default version
+
+
+def select_documents_for_final_download(
+    download_database: DownloadDatabase, some_keywords_were_not_searched: bool
+) -> dict:  # Everything that is still waiting once all keywords are searched
+    urls_grouped_by_document = group_urls_by_document(
+        download_database.load_unprocessed_urls()
+    )  # Every document that still has a pending version
+    if (
+        some_keywords_were_not_searched
+    ):  # A better version might be hiding in a keyword that was never searched
+        download_logger.warning(
+            "Some keywords were not searched, so only default versions are downloaded now; fallback versions wait for the next run"
+        )  # Explain the limit
+        urls_grouped_by_document = keep_only_documents_with_default_version(
+            urls_grouped_by_document
+        )  # Never download a fallback version too early
+    return urls_grouped_by_document  # Give the documents back
+
+
+def download_documents_using_temporary_tab(
     browser_session: "BrowserSession",
     download_database: DownloadDatabase,
-    urls_to_download: list,
+    documents_to_download: dict,
     run_statistics: RunStatistics,
 ) -> None:  # Download, opening a second tab only when needed
-    """Skip files that already exist, then open the download tab only if something is left to do."""  # Short description
-    urls_still_needed = []  # Collects the URLs whose files are really missing
-    for source_url in urls_to_download:  # Check each URL before opening any tab
-        if download_database.is_file_for_url_already_downloaded(
-            source_url
-        ):  # The file already exists
-            download_logger.info(
-                "  SKIP: the file for %s already exists", source_url
-            )  # Explain the skip
-            download_database.mark_url_processed(
-                source_url
-            )  # Remember that this URL is finished
-            run_statistics.skipped_count += 1  # Count the skip
-        else:  # The file is missing
-            urls_still_needed.append(source_url)  # Keep the URL for downloading
-    if not urls_still_needed:  # Check whether anything is left to download
+    """Skip documents that already have a file, then open the download tab only if something is left to do."""  # Short description
+    documents_still_needed = {}  # Collects the documents that really have no file yet
+    for (
+        document_key,
+        candidate_urls,
+    ) in documents_to_download.items():  # Check each document before opening any tab
+        if download_database.is_any_version_of_document_saved(
+            document_key
+        ):  # One version is already saved
+            mark_versions_as_skipped(
+                download_database,
+                candidate_urls,
+                run_statistics,
+                "this document already has a saved version",
+            )  # Never download another version
+        else:  # The document still needs a file
+            documents_still_needed[
+                document_key
+            ] = candidate_urls  # Keep it for downloading
+    if not documents_still_needed:  # Check whether anything is left to download
         download_logger.info(
             "Nothing to download in this batch, so no second tab is opened"
         )  # Record the decision
         return  # Leave without opening a tab
     browser_session.internet_monitor.raise_error_if_internet_is_down()  # Do not open a tab while the internet is down
     with browser_session.temporary_download_tab() as download_page:  # Open the second tab and close it afterwards
-        download_pdf_files_from_urls(
+        download_best_version_of_each_document(
             download_page,
             download_database,
-            urls_still_needed,
+            documents_still_needed,
             run_statistics,
             browser_session.internet_monitor,
             browser_session.active_results_page,
-        )  # Download the missing files
+        )  # Download one version of each document
 
 
 # ============================================================== SCRAPING
@@ -1695,19 +1950,19 @@ def search_one_keyword_and_download_pdfs(
             download_database.save_newly_found_urls(
                 new_urls
             )  # Store the new addresses in the database
-            urls_pending_download = download_database.keep_only_unprocessed_urls(
-                sorted(new_urls)
-            )  # Work out which of them still need downloading
+            default_version_documents = select_documents_with_default_version(
+                download_database, new_urls
+            )  # Documents whose default version is on this page
             download_logger.info(
-                "[%s] page %d: downloading %d PDF(s) right away",
+                "[%s] page %d: downloading %d default version(s) right away; fallback versions wait until every keyword is searched",
                 search_keyword,
                 page_number,
-                len(urls_pending_download),
+                len(default_version_documents),
             )  # Say what happens next
-            download_pdf_files_using_temporary_tab(
+            download_documents_using_temporary_tab(
                 browser_session,
                 download_database,
-                urls_pending_download,
+                default_version_documents,
                 run_statistics,
             )  # Download them now
 
@@ -2330,7 +2585,7 @@ def run_sds_downloader() -> None:  # Run the whole job from start to finish
     download_database.register_pdf_files_already_on_disk(
         DOWNLOAD_FOLDER
     )  # Remember PDFs that are already in the folder
-    download_database.ignore_urls_that_are_not_usa_english()  # Skip old pending URLs that are not USA English
+    download_database.ignore_urls_in_unwanted_formats()  # Skip old pending URLs that are not in a wanted format
 
     run_statistics = RunStatistics()  # Running totals for the whole run
 
@@ -2351,6 +2606,9 @@ def run_sds_downloader() -> None:  # Run the whole job from start to finish
                 )  # Record the problem
             browser_session.close_unneeded_tabs()  # Leave only the results tab open after the warm-up
 
+            still_failed_keywords: list = (
+                []
+            )  # Keywords that could not be searched even after a second try
             failed_keywords = search_keywords_and_return_failed_ones(
                 browser_session, download_database, SEARCH_KEYWORDS, run_statistics
             )  # Search every keyword once
@@ -2370,17 +2628,19 @@ def run_sds_downloader() -> None:  # Run the whole job from start to finish
                     )  # Report them
 
             download_logger.info(
-                "Retrying URLs that are still pending"
-            )  # Record the final retry
-            run_step_and_restart_browser_if_needed(  # Retry pending URLs, restarting the browser if it closes
+                "All keywords searched: downloading the best available version of every remaining document"
+            )  # Record the final step
+            run_step_and_restart_browser_if_needed(  # Download the remaining documents, restarting the browser if it closes
                 browser_session,  # The session that owns the browser
-                "the retry of pending URLs",  # Description used in log messages
-                lambda: download_pdf_files_using_temporary_tab(
+                "the final download of the best remaining versions",  # Description used in log messages
+                lambda: download_documents_using_temporary_tab(
                     browser_session,
                     download_database,
-                    download_database.load_unprocessed_urls(),
+                    select_documents_for_final_download(
+                        download_database, bool(still_failed_keywords)
+                    ),
                     run_statistics,
-                ),  # Re-reads the pending URLs on every attempt
+                ),  # Re-reads the waiting documents on every attempt
             )  # End of the restart wrapper
         finally:  # Always runs, even after an error
             internet_monitor.stop_monitoring()  # Stop the background internet check
