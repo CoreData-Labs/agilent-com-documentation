@@ -1,41 +1,55 @@
 #!/usr/bin/env python3
-# Download all USA English SDS / MSDS PDFs from Agilent's chemical-standards search page.  # Purpose of the script
-# The browser is started through invisible_playwright (Playwright on an anti-detect Firefox).  # Browser used
-# 1. Start the browser at 1920x1080 and open the first tab (the results tab).  # Step 1
-# 2. Open the home page, browse it for about 30 seconds, then open 3 other pages for about 30 seconds each.  # Step 2
-# 3. Search every keyword a-z and 0-9 (all letters and digits of the site's search).  # Step 3
-# 4. After every result page, download the PDFs found there using a temporary second tab.  # Step 4
-# 5. A SQLite database remembers every URL and file name so nothing is downloaded twice.  # Step 5
-# 6. If the browser crashes or closes, it is restarted and the work continues.  # Step 6
-# 7. "Page may no longer exist" pages are marked as done and never retried.  # Step 7
-# 8. Random pauses, exponential back-off and a stop-after-N-blocks rule keep the traffic gentle.  # Step 8
-# 9. A background thread checks the internet; the main thread restarts the browser after an outage.  # Step 9
-# 10. Only USA English files (names ending in _NAEnglish.pdf) are downloaded.  # Step 10
-# 11. Only the results tab stays open; the download tab exists only while downloading.  # Step 11
-# 12. Everything is logged to the console at DEBUG level.  # Step 12
+# Agilent SDS downloader.
+#
+# Downloads every USA English Safety Data Sheet PDF found on Agilent's chemical-standards search page.
+# The browser is controlled through invisible_playwright (Playwright on an anti-detect Firefox).
+#
+# How the script works:
+#   * It starts one browser window at 1920x1080 with a single "results" tab.
+#   * It visits the home page and a few other pages first, behaving like an ordinary visitor.
+#   * It then searches the keywords a-z and 0-9, one after another.
+#   * After each page of results it downloads the PDFs found there, using a short-lived second tab
+#     that is opened only when something needs downloading and closed right afterwards.
+#   * Only the results tab is ever kept open; popups, extra tabs and extra windows are closed at once.
+#   * A SQLite database remembers every URL and file name, so nothing is downloaded twice.
+#   * If the browser crashes, or the internet drops, the browser is restarted and the work continues.
+#   * Random pauses, back-off waits and a "stop after too many blocks" rule keep the traffic gentle.
+#   * Keywords that could not be searched are retried once at the end.
+#   * Everything is logged to the console at DEBUG level.
 
+import asyncio  # Lets us check several internet hosts at the same time
 import logging  # Prints log lines to the console
 import math  # Distance and curve calculations for human-like mouse movement
 import random  # Picks random pause lengths and random actions
 import re  # Regular expressions for link matching and text cleaning
 import shutil  # Finds the "ping" program on the system PATH
 import socket  # Opens a plain TCP connection when ping is unavailable
-import sqlite3  # Built-in database used to remember what is already downloaded
+import sqlite3  # Built-in database that remembers what has been downloaded
 import string  # Supplies the lowercase letters and digits used as search keywords
 import subprocess  # Runs "ping" as an external process
-import sys  # Gives access to stdout and the current platform name
+import sys  # Gives access to standard output and the current platform name
 import threading  # Runs the internet check in the background
 import time  # Provides sleep() and the current time
-from contextlib import contextmanager  # Turns a method into a usable "with" block
+from concurrent.futures import (
+    ThreadPoolExecutor,
+)  # Runs the async internet check in its own clean thread
+from contextlib import (
+    contextmanager,
+)  # Turns a method into something usable in a "with" block
+from dataclasses import dataclass  # Makes small classes that only hold data
 from pathlib import Path  # Object-oriented filesystem paths
-from typing import Iterator, Optional  # Type hints for generators and optional values
+from typing import (
+    Any,
+    Iterator,
+    Optional,
+)  # Type hints for generators, optional values and Playwright objects
 from urllib.parse import unquote, urlparse  # Helpers to read a file name out of a URL
 
 from invisible_playwright import (
     InvisiblePlaywright,
 )  # Playwright on an anti-detect Firefox
 
-from invisible_playwright._pw.sync_api import (  # Its bundled Playwright classes (errors only match this copy)
+from invisible_playwright._pw.sync_api import (  # The Playwright copy bundled with invisible_playwright (its errors only match this copy)
     Dialog,  # Type of alert/confirm popups
     Download,  # Type of a browser download
     Page,  # Type of a browser tab
@@ -45,93 +59,129 @@ from invisible_playwright._pw.sync_api import (  # Its bundled Playwright classe
 
 # ============================================================== SETTINGS
 
-SEARCH_URL_TEMPLATE = "https://www.agilent.com/en/product/chemical-standards/search-results?tabname=related_part_number&keyword={search_keyword}"  # Search URL with a keyword placeholder
+SEARCH_URL_TEMPLATE = "https://www.agilent.com/en/product/chemical-standards/search-results?tabname=related_part_number&keyword={search_keyword}"  # Search page address; the keyword is filled in later
 SEARCH_KEYWORDS = list(
     string.ascii_lowercase + string.digits
-)  # Every keyword: letters a-z then digits 0-9
-HOME_PAGE_URL = "https://www.agilent.com/"  # Page visited first, like a normal visitor
+)  # Every keyword to search: the letters a-z followed by the digits 0-9
+HOME_PAGE_URL = (
+    "https://www.agilent.com/"  # The page visited first, like a normal visitor would
+)
 HOME_PAGE_BROWSING_SECONDS = (
-    30  # Seconds of mouse and scrolling activity on the home page
+    30  # How long to move the mouse and scroll on the home page
 )
-OTHER_PAGES_TO_VISIT = 3  # How many different pages are opened from the home page
-OTHER_PAGE_BROWSING_SECONDS = 30  # Seconds spent on each of those pages
-REQUIRED_FILE_NAME_ENDING = (
-    "_NAEnglish.pdf"  # Only files whose name ends like this are downloaded
-)
+OTHER_PAGES_TO_VISIT = 3  # How many other pages are opened from the home page
+OTHER_PAGE_BROWSING_SECONDS = 30  # How long to stay on each of those pages
+REQUIRED_USA_ENGLISH_FILE_NAME_ENDING = "_NAEnglish.pdf"  # Only files whose name ends like this (USA English) are downloaded
 
-VIEWPORT_WIDTH_PIXELS = 1920  # Browser window width (full HD)
-VIEWPORT_HEIGHT_PIXELS = 1080  # Browser window height (full HD)
+BROWSER_WINDOW_WIDTH_PIXELS = 1920  # Browser window width in pixels (full HD)
+BROWSER_WINDOW_HEIGHT_PIXELS = 1080  # Browser window height in pixels (full HD)
 
-DOWNLOAD_FOLDER = Path(
-    "PDFs"
-).resolve()  # Absolute path of the folder where PDFs are saved
+DOWNLOAD_FOLDER = Path("PDFs").resolve()  # Full path of the folder where PDFs are saved
 DATABASE_FILE_PATH = Path(
     "download_history.sqlite3"
-).resolve()  # Absolute path of the SQLite file
+).resolve()  # Full path of the SQLite history file
 MAXIMUM_FILE_NAME_STEM_LENGTH = 150  # Longest allowed file name, not counting ".pdf"
-SQL_PLACEHOLDER_CHUNK_SIZE = (
-    500  # Maximum number of "?" placeholders used in one SQL query
+MAXIMUM_URLS_PER_DATABASE_QUERY = (
+    500  # Most "?" placeholders used in one SQL query (SQLite has a limit)
 )
 
 MAXIMUM_RESULT_PAGES_PER_KEYWORD = (
-    200  # Safety limit on result pages followed per keyword
+    200  # Safety limit on how many result pages are followed per keyword
 )
-NAVIGATION_TIMEOUT_MS = 30_000  # How long to wait for a page to open
-DOWNLOAD_TIMEOUT_MS = 60_000  # How long to wait for the browser to start one download
+PAGE_LOAD_TIMEOUT_MILLISECONDS = (
+    30_000  # How long to wait for a page to open, in milliseconds
+)
+DOWNLOAD_START_TIMEOUT_MILLISECONDS = (
+    60_000  # How long to wait for the browser to start one download, in milliseconds
+)
 
-PAUSE_BETWEEN_RESULT_PAGES = (
+PAUSE_SECONDS_RANGE_BETWEEN_RESULT_PAGES = (
     2.0,
     5.0,
-)  # Random pause range (seconds) before the next result page
-PAUSE_BETWEEN_DOWNLOADS = (
+)  # Random pause range (seconds) before moving to the next result page
+PAUSE_SECONDS_RANGE_BETWEEN_DOWNLOADS = (
     1.0,
     3.0,
 )  # Random pause range (seconds) between two downloads
-PAUSE_BETWEEN_KEYWORDS = (
+PAUSE_SECONDS_RANGE_BETWEEN_KEYWORDS = (
     5.0,
     10.0,
 )  # Random pause range (seconds) before the next keyword
-ACTIVITY_AFTER_OPENING_SEARCH_PAGE = (
+ACTIVITY_SECONDS_RANGE_AFTER_OPENING_SEARCH_PAGE = (
     3.0,
     6.0,
 )  # Random activity time (seconds) after a search page opens
-MAX_ACCESS_DENIED_ATTEMPTS = (
-    3  # How many times to retry a page that shows "Access Denied"
+MAXIMUM_ACCESS_DENIED_ATTEMPTS = (
+    3  # How many times a page showing "Access Denied" is retried
 )
 ACCESS_DENIED_BACKOFF_SECONDS = (
-    30  # First back-off wait; doubles on each further attempt
+    30  # First back-off wait in seconds; it doubles on every further attempt
 )
-MAX_CONSECUTIVE_BLOCKS = 5  # Stop the whole run after this many blocks in a row
-MAX_BROWSER_RESTARTS = (
-    5  # How many times the browser may be restarted after closing or crashing
+MAXIMUM_CONSECUTIVE_BLOCKS = 5  # The whole run stops after this many blocks in a row
+MAXIMUM_BROWSER_RESTARTS = (
+    5  # How many times the browser may be restarted after a crash
 )
 
 INTERNET_CHECK_HOSTS = (
     "1.1.1.1",
     "8.8.8.8",
-)  # Addresses pinged to check whether the internet works
+)  # Public addresses used to test whether the internet works
 INTERNET_CHECK_INTERVAL_SECONDS = 10  # How often the background internet check runs
 PING_TIMEOUT_SECONDS = 5  # How long to wait for one ping answer
-TCP_FALLBACK_PORT = (
-    53  # Port used for a plain connection test when ping is unavailable (DNS port)
+FALLBACK_CONNECTION_TEST_PORT = (
+    53  # Port for a plain connection test when ping is unavailable (the DNS port)
 )
-TCP_FALLBACK_TIMEOUT_SECONDS = 2  # How long to wait for that fallback connection test
+FALLBACK_CONNECTION_TEST_TIMEOUT_SECONDS = (
+    2  # How long to wait for that fallback connection test
+)
 
 download_logger = logging.getLogger(
     "sds_downloader"
-)  # Logger used by every function in this script
+)  # The logger used by every function in this script
+
+
+def validate_settings() -> None:  # Stop immediately if a setting above is obviously wrong
+    assert (
+        SEARCH_KEYWORDS
+    ), "SEARCH_KEYWORDS must contain at least one keyword"  # There must be something to search
+    assert (
+        BROWSER_WINDOW_WIDTH_PIXELS > 0 and BROWSER_WINDOW_HEIGHT_PIXELS > 0
+    ), "The browser window size must be positive"  # A window needs a real size
+    assert REQUIRED_USA_ENGLISH_FILE_NAME_ENDING.lower().endswith(
+        ".pdf"
+    ), "REQUIRED_USA_ENGLISH_FILE_NAME_ENDING must end with .pdf"  # We only download PDF files
+    for pause_range in (
+        PAUSE_SECONDS_RANGE_BETWEEN_RESULT_PAGES,
+        PAUSE_SECONDS_RANGE_BETWEEN_DOWNLOADS,
+        PAUSE_SECONDS_RANGE_BETWEEN_KEYWORDS,
+        ACTIVITY_SECONDS_RANGE_AFTER_OPENING_SEARCH_PAGE,
+    ):  # Look at every random pause range
+        assert (
+            0 <= pause_range[0] <= pause_range[1]
+        ), f"Pause range {pause_range} must be (low, high) with low <= high"  # The low value must not exceed the high value
 
 
 class AccessBlockedError(
     Exception
-):  # Raised when the site keeps blocking us and we should stop
-    """The website kept blocking us; the whole run should stop."""  # Explanation of the error
+):  # Raised when the website keeps blocking us and the run should stop
+    """The website kept blocking us; the whole run should stop."""  # Short description of the error
 
 
 class InternetOutageError(
     Exception
 ):  # Raised when the internet is down in the middle of a step
-    """The internet is down; the current step should be retried once it is back."""  # Explanation of the error
+    """The internet is down; the current step should be retried once it is back."""  # Short description of the error
+
+
+@dataclass  # Automatically creates the constructor for this little data holder
+class RunStatistics:  # Running totals for the whole run
+    downloaded_count: int = 0  # PDFs saved to disk
+    skipped_count: int = (
+        0  # URLs skipped because the file already exists or is not a PDF
+    )
+    unavailable_count: int = 0  # URLs whose page says it may no longer exist
+    failed_count: int = 0  # URLs that could not be downloaded this time
+    consecutive_block_count: int = 0  # "Access Denied" pages seen in a row
 
 
 # ============================================================== LOGGING
@@ -143,15 +193,15 @@ def configure_console_logging() -> None:  # Send every log message to the consol
     )  # Create a handler that writes to standard output
     console_handler.setLevel(
         logging.DEBUG
-    )  # The handler lets every level through, including DEBUG
+    )  # Let every message level through, including DEBUG
     console_handler.setFormatter(
         logging.Formatter(
             "%(asctime)s | %(levelname)-8s | %(message)s", "%Y-%m-%d %H:%M:%S"
         )
-    )  # Choose the line format
+    )  # Choose how each line looks
     download_logger.setLevel(
         logging.DEBUG
-    )  # The logger level is DEBUG, the most detailed level
+    )  # Make DEBUG the lowest level the logger accepts
     if (
         not download_logger.handlers
     ):  # Only attach a handler once, so lines are never printed twice
@@ -159,20 +209,20 @@ def configure_console_logging() -> None:  # Send every log message to the consol
             console_handler
         )  # Attach the console handler to our logger
     download_logger.propagate = (
-        False  # Prevent every line from being printed twice by the root logger
+        False  # Stop the root logger from printing every line a second time
     )
 
 
 def attach_browser_event_logging(
     browser_page: Page,
-) -> None:  # Connect logging to a single browser tab
-    """Wire up console/error/request/response/navigation/download/dialog logging for one tab."""  # Explanation
+) -> None:  # Connect logging to one browser tab
+    """Log console output, errors, failed requests, navigation, downloads and popups of one tab."""  # Short description
     browser_page.on(
         "console",
         lambda console_message: download_logger.debug(
             "BROWSER CONSOLE [%s] %s", console_message.type, console_message.text
         ),
-    )  # Log the website's own console output
+    )  # Log what the website prints to its own console
     browser_page.on(
         "pageerror",
         lambda page_error: download_logger.error("BROWSER PAGE ERROR %s", page_error),
@@ -185,7 +235,7 @@ def attach_browser_event_logging(
             failed_request.url,
             failed_request.failure,
         ),
-    )  # Log failed network requests
+    )  # Log network requests that failed
     browser_page.on(
         "response",
         lambda http_response: download_logger.warning(
@@ -193,7 +243,7 @@ def attach_browser_event_logging(
         )
         if http_response.status >= 400
         else None,
-    )  # Log HTTP error responses
+    )  # Log HTTP error answers (400 and above)
     browser_page.on(
         "framenavigated",
         lambda navigated_frame: download_logger.info(
@@ -201,7 +251,7 @@ def attach_browser_event_logging(
         )
         if navigated_frame.parent_frame is None
         else None,
-    )  # Log top-level page changes
+    )  # Log changes of the top-level page address
     browser_page.on(
         "download",
         lambda started_download: download_logger.info(
@@ -213,7 +263,7 @@ def attach_browser_event_logging(
 
     def handle_dialog_popup(
         dialog_popup: Dialog,
-    ) -> None:  # Deal with alert/confirm popups so they cannot block us
+    ) -> None:  # Deal with alert/confirm popups so they can never block us
         download_logger.warning(
             "BROWSER DIALOG [%s] %s", dialog_popup.type, dialog_popup.message
         )  # Log what the popup said
@@ -221,20 +271,40 @@ def attach_browser_event_logging(
 
     browser_page.on(
         "dialog", handle_dialog_popup
-    )  # Attach the dialog handler to this tab
+    )  # Attach the popup handler to this tab
 
 
 def log_run_statistics(
-    run_statistics: dict, label_text: str
-) -> None:  # Print the running totals
+    run_statistics: RunStatistics, summary_label: str
+) -> None:  # Print the running totals on one line
     download_logger.info(
         "%s: downloaded %d | skipped %d | page unavailable %d | failed %d",
-        label_text,
-        run_statistics["downloaded"],
-        run_statistics["skipped"],
-        run_statistics["unavailable"],
-        run_statistics["failed"],
-    )  # Write one summary line
+        summary_label,
+        run_statistics.downloaded_count,
+        run_statistics.skipped_count,
+        run_statistics.unavailable_count,
+        run_statistics.failed_count,
+    )  # Write the summary line
+
+
+# ============================================================== SMALL HELPERS
+
+
+def split_into_batches(
+    items_to_split: list, maximum_batch_size: int
+) -> Iterator[list]:  # Hand out a long list in smaller pieces
+    for batch_start_position in range(
+        0, len(items_to_split), maximum_batch_size
+    ):  # Jump forward one batch at a time
+        yield items_to_split[
+            batch_start_position : batch_start_position + maximum_batch_size
+        ]  # Give back the next piece of the list
+
+
+def remove_fragment_from_url(
+    page_url: str,
+) -> str:  # Remove the "#section" part of a web address
+    return page_url.split("#")[0]  # Keep only what comes before the first "#"
 
 
 # ============================================================== DATABASE
@@ -252,51 +322,51 @@ class DownloadDatabase:  # Wraps the SQLite connection and every query this scri
         self.database_connection = sqlite3.connect(
             database_path
         )  # Connect to the database file on disk
-        with self.database_connection:  # Commit automatically when this block finishes
+        with self.database_connection:  # Save the changes automatically when this block ends
             self.database_connection.execute(
                 "CREATE TABLE IF NOT EXISTS collected_urls (source_url TEXT PRIMARY KEY, is_processed INTEGER NOT NULL DEFAULT 0)"
-            )  # One row per URL, with a done flag
+            )  # One row per URL, with a "done" flag
             self.database_connection.execute(
                 "CREATE TABLE IF NOT EXISTS downloaded_files (file_name TEXT PRIMARY KEY COLLATE NOCASE, source_url TEXT NOT NULL, downloaded_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)"
             )  # One row per saved file name
 
     def close_database(self) -> None:  # Close the database connection
-        self.database_connection.close()  # Release the file handle
+        self.database_connection.close()  # Release the database file
 
-    def register_existing_pdf_files(
+    def register_pdf_files_already_on_disk(
         self, pdf_folder: Path
-    ) -> None:  # Remember PDFs already on disk
-        """Record PDFs already on disk so they are never downloaded again."""  # Explanation
+    ) -> None:  # Remember PDFs that are already on disk
+        """Record PDFs already on disk so they are never downloaded again."""  # Short description
         newly_registered_count = (
             0  # Counts how many existing files were newly registered
         )
-        with self.database_connection:  # Commit automatically when this block finishes
+        with self.database_connection:  # Save the changes automatically when this block ends
             for pdf_path in pdf_folder.glob(
                 "*.pdf"
             ):  # Look at every PDF already in the folder
-                insert_cursor = self.database_connection.execute(
+                insert_result = self.database_connection.execute(
                     "INSERT OR IGNORE INTO downloaded_files (file_name, source_url) VALUES (?, ?)",
                     (pdf_path.name, "found on disk before first run"),
                 )  # Insert the file name unless it is already recorded
                 newly_registered_count += (
-                    insert_cursor.rowcount
-                )  # Add 1 when a new row was really inserted
+                    insert_result.rowcount
+                )  # Add one when a new row was really inserted
         download_logger.info(
             "Registered %d existing PDF file(s) from %s",
             newly_registered_count,
             pdf_folder,
         )  # Report the result
 
-    def ignore_non_usa_english_urls(
+    def ignore_urls_that_are_not_usa_english(
         self,
     ) -> None:  # Drop old pending URLs we no longer want
-        """Mark pending URLs that fail the language filter as done (e.g. after a settings change)."""  # Explanation
-        pending_urls = self.load_unprocessed_urls()  # Every URL that is still pending
+        """Mark pending URLs that fail the language filter as done (for example after a settings change)."""  # Short description
+        pending_urls = self.load_unprocessed_urls()  # Every URL that is still waiting
         ignored_urls = [
             pending_url
             for pending_url in pending_urls
             if not is_usa_english_pdf_url(pending_url)
-        ]  # Keep only the ones that fail the filter
+        ]  # Keep the ones that fail the filter
         for ignored_url in ignored_urls:  # Go through each URL that should be ignored
             self.mark_url_processed(
                 ignored_url
@@ -304,49 +374,48 @@ class DownloadDatabase:  # Wraps the SQLite connection and every query this scri
         download_logger.info(
             "Ignored %d pending URL(s) that do not end in %s",
             len(ignored_urls),
-            REQUIRED_FILE_NAME_ENDING,
+            REQUIRED_USA_ENGLISH_FILE_NAME_ENDING,
         )  # Report the result
 
-    def save_new_urls(self, found_urls: set) -> None:  # Store newly found URLs
-        with self.database_connection:  # Commit automatically when this block finishes
-            insert_cursor = self.database_connection.executemany(
+    def save_newly_found_urls(self, found_urls: set) -> None:  # Store newly found URLs
+        with self.database_connection:  # Save the changes automatically when this block ends
+            insert_result = self.database_connection.executemany(
                 "INSERT OR IGNORE INTO collected_urls (source_url) VALUES (?)",
                 [(found_url,) for found_url in found_urls],
-            )  # Insert many URLs, ignoring known ones
+            )  # Insert many URLs at once, ignoring known ones
         download_logger.info(
             "Saved %d new URL(s) (%d were already known)",
-            insert_cursor.rowcount,
-            len(found_urls) - insert_cursor.rowcount,
+            insert_result.rowcount,
+            len(found_urls) - insert_result.rowcount,
         )  # Report the result
 
     def load_unprocessed_urls(self) -> list:  # Get every URL that still needs work
-        result_rows = self.database_connection.execute(
+        database_rows = self.database_connection.execute(
             "SELECT source_url FROM collected_urls WHERE is_processed = 0 ORDER BY source_url"
-        )  # Ask the database for the pending URLs
+        )  # Ask the database for the waiting URLs
         return [
-            result_row[0] for result_row in result_rows.fetchall()
+            database_row[0] for database_row in database_rows.fetchall()
         ]  # Return just the URL text of each row
 
-    def filter_unprocessed(
+    def keep_only_unprocessed_urls(
         self, candidate_urls: list
-    ) -> list:  # Keep only the URLs from this list that are still pending
-        pending_urls = set()  # Collects the URLs the database says are pending
-        for chunk_start in range(
-            0, len(candidate_urls), SQL_PLACEHOLDER_CHUNK_SIZE
-        ):  # Work in chunks so SQLite's variable limit is never exceeded
-            url_chunk = candidate_urls[
-                chunk_start : chunk_start + SQL_PLACEHOLDER_CHUNK_SIZE
-            ]  # The URLs of this chunk
+    ) -> list:  # Keep only the URLs from this list that are still waiting
+        pending_urls: set[
+            str
+        ] = set()  # Collects the URLs the database says are waiting
+        for url_batch in split_into_batches(
+            candidate_urls, MAXIMUM_URLS_PER_DATABASE_QUERY
+        ):  # Work in batches so SQLite's variable limit is never exceeded
             placeholder_text = ",".join(
-                "?" for chunk_url in url_chunk
-            )  # One "?" per URL for the SQL query
-            result_rows = self.database_connection.execute(
+                "?" for url_in_batch in url_batch
+            )  # One "?" per URL in this batch
+            database_rows = self.database_connection.execute(
                 f"SELECT source_url FROM collected_urls WHERE is_processed = 0 AND source_url IN ({placeholder_text})",
-                url_chunk,
-            )  # Ask which of these URLs are pending
+                url_batch,
+            )  # Ask which of these URLs are still waiting
             pending_urls.update(
-                result_row[0] for result_row in result_rows.fetchall()
-            )  # Remember the pending ones
+                database_row[0] for database_row in database_rows.fetchall()
+            )  # Remember the waiting ones
         return [
             candidate_url
             for candidate_url in candidate_urls
@@ -354,13 +423,13 @@ class DownloadDatabase:  # Wraps the SQLite connection and every query this scri
         ]  # Keep the candidates in their original order
 
     def mark_url_processed(self, source_url: str) -> None:  # Mark one URL as done
-        with self.database_connection:  # Commit automatically when this block finishes
+        with self.database_connection:  # Save the change automatically when this block ends
             self.database_connection.execute(
                 "UPDATE collected_urls SET is_processed = 1 WHERE source_url = ?",
                 (source_url,),
-            )  # Flip the done flag
+            )  # Switch the "done" flag on
 
-    def is_file_name_downloaded(
+    def is_file_name_already_saved(
         self, file_name: str
     ) -> bool:  # Check whether a file name was already saved
         matching_row = self.database_connection.execute(
@@ -368,19 +437,19 @@ class DownloadDatabase:  # Wraps the SQLite connection and every query this scri
         ).fetchone()  # Look the name up
         return matching_row is not None  # True when a matching row exists
 
-    def record_downloaded_file(
+    def record_saved_file(
         self, file_name: str, source_url: str
     ) -> None:  # Save a record of a downloaded file
-        with self.database_connection:  # Commit automatically when this block finishes
+        with self.database_connection:  # Save the change automatically when this block ends
             self.database_connection.execute(
                 "INSERT OR IGNORE INTO downloaded_files (file_name, source_url) VALUES (?, ?)",
                 (file_name, source_url),
             )  # Insert a row describing the saved file
 
-    def is_url_already_downloaded_by_name(
+    def is_file_for_url_already_downloaded(
         self, source_url: str
-    ) -> bool:  # Cheap pre-check before downloading
-        """If the URL's own file name is already known or on disk, there is no need to download it."""  # Explanation
+    ) -> bool:  # Cheap check done before downloading anything
+        """If the file name that the URL implies is already known or on disk, there is no need to download it."""  # Short description
         guessed_file_name = guess_file_name_from_url(
             source_url
         )  # Predict the file name from the URL itself
@@ -390,7 +459,7 @@ class DownloadDatabase:  # Wraps the SQLite connection and every query this scri
             guessed_file_name
         )  # Apply the naming rules to the guess
         return (
-            self.is_file_name_downloaded(safe_file_name)
+            self.is_file_name_already_saved(safe_file_name)
             or (DOWNLOAD_FOLDER / safe_file_name).exists()
         )  # Known in the database or already on disk
 
@@ -403,7 +472,7 @@ def guess_file_name_from_url(
 ) -> Optional[str]:  # Predict the file name before downloading
     last_path_segment = Path(
         unquote(urlparse(source_url).path)
-    ).name  # Take the last part of the URL's path, decoded
+    ).name  # Take the last part of the address path, with %20-style codes decoded
     return (
         last_path_segment if last_path_segment.lower().endswith(".pdf") else None
     )  # Only trust names that really end in .pdf
@@ -415,129 +484,131 @@ def is_usa_english_pdf_url(
     return (
         unquote(urlparse(source_url).path)
         .lower()
-        .endswith(REQUIRED_FILE_NAME_ENDING.lower())
+        .endswith(REQUIRED_USA_ENGLISH_FILE_NAME_ENDING.lower())
     )  # True when the path ends in _NAEnglish.pdf
 
 
 def build_safe_file_name(
     raw_file_name: str,
-) -> str:  # Clean a file name to follow the naming rules
+) -> str:  # Clean a file name so it follows the naming rules
     file_name_stem = (
         raw_file_name[:-4] if raw_file_name.lower().endswith(".pdf") else raw_file_name
-    )  # Strip ".pdf" before cleaning
+    )  # Remove ".pdf" before cleaning
     file_name_stem = re.sub(
         r"[^a-z0-9_]+", "_", file_name_stem.lower()
-    )  # Lowercase, then replace anything but a-z/0-9/_ with _
+    )  # Lowercase everything and replace odd characters with underscores
     file_name_stem = re.sub(r"_+", "_", file_name_stem)[
         :MAXIMUM_FILE_NAME_STEM_LENGTH
     ].strip(
         "_"
-    )  # Collapse underscores, cut to length, trim the ends
+    )  # Merge repeated underscores, shorten, and trim the ends
     return (
         file_name_stem or "document"
-    ) + ".pdf"  # Fall back to "document" if nothing is left, then add .pdf again
+    ) + ".pdf"  # Use "document" if nothing is left, then add .pdf again
 
 
-# ============================================================== PACING AND BLOCK TRACKING
+# ============================================================== BLOCK TRACKING
 
 
 def register_access_block(
-    run_statistics: dict,
+    run_statistics: RunStatistics,
 ) -> None:  # Count one more "Access Denied" in a row
-    run_statistics["consecutive_blocks"] += 1  # Add one to the blocks-in-a-row counter
+    run_statistics.consecutive_block_count += (
+        1  # Add one to the blocks-in-a-row counter
+    )
     download_logger.warning(
         "Consecutive access blocks: %d/%d",
-        run_statistics["consecutive_blocks"],
-        MAX_CONSECUTIVE_BLOCKS,
-    )  # Record the current count
+        run_statistics.consecutive_block_count,
+        MAXIMUM_CONSECUTIVE_BLOCKS,
+    )  # Show the current count
     if (
-        run_statistics["consecutive_blocks"] >= MAX_CONSECUTIVE_BLOCKS
-    ):  # Check whether the limit is reached
+        run_statistics.consecutive_block_count >= MAXIMUM_CONSECUTIVE_BLOCKS
+    ):  # Check whether the limit has been reached
         raise AccessBlockedError(
-            f"The website blocked {MAX_CONSECUTIVE_BLOCKS} requests in a row. Stopping so the block does not get worse. Try again later or contact Agilent."
+            f"The website blocked {MAXIMUM_CONSECUTIVE_BLOCKS} requests in a row. Stopping so the block does not get worse. Try again later or contact Agilent."
         )  # Stop the whole run
 
 
 def reset_access_blocks(
-    run_statistics: dict,
-) -> None:  # A page opened fine, so the blocks-in-a-row count restarts
-    run_statistics["consecutive_blocks"] = 0  # Set the counter back to zero
+    run_statistics: RunStatistics,
+) -> None:  # A page loaded fine, so the blocks-in-a-row count starts again
+    run_statistics.consecutive_block_count = 0  # Set the counter back to zero
 
 
 # ============================================================== PAGE CHECKS & ACTIONS
 
-PAGE_UNAVAILABLE_MESSAGE = "the page may be temporarily unavailable or may no longer exist"  # Text of the error page
+PAGE_UNAVAILABLE_MESSAGE = "the page may be temporarily unavailable or may no longer exist"  # Text shown on the website's error page
 
 
-def is_access_denied_page(
+def is_access_denied_error_page(
     browser_page: Page,
 ) -> bool:  # Check whether the website blocked this visit
     try:  # Reading the page can fail while it is changing
         page_title, page_source = (
             browser_page.title(),
             browser_page.content(),
-        )  # Read the page title and source
+        )  # Read the page title and its HTML source
     except PlaywrightError:  # The page could not be read
         return False  # Assume the page is fine
-    lowercase_source = (
+    lowercase_page_source = (
         page_source.lower()
-    )  # Lowercase copy so the checks ignore capitals
-    is_blocked = (  # Decide whether this is the "Access Denied" block page
-        "access denied" in page_title.lower()  # The title says Access Denied
+    )  # Lowercase copy so the checks ignore capital letters
+    is_blocked_by_website = (  # Decide whether this is the "Access Denied" block page
+        "access denied" in page_title.lower()  # The title says "Access Denied"
         or "errors.edgesuite.net"
-        in lowercase_source  # The page links to the Akamai error site
+        in lowercase_page_source  # The page links to the Akamai error site
         or "you don't have permission to access"
-        in lowercase_source  # The usual block message
-    )  # End of the check
-    if is_blocked:  # The website blocked us
-        reference_match = re.search(
+        in lowercase_page_source  # The usual block message appears
+    )  # End of the decision
+    if is_blocked_by_website:  # The website blocked us
+        block_reference_match = re.search(
             r"Reference #([0-9a-fA-F.]+)", page_source
-        )  # Look for the reference number
+        )  # Look for the block's reference number
         download_logger.warning(
             "ACCESS DENIED page detected (reference %s) at %s",
-            reference_match.group(1) if reference_match else "unknown",
+            block_reference_match.group(1) if block_reference_match else "unknown",
             browser_page.url,
-        )  # Record it
-    return is_blocked  # Tell the caller whether we were blocked
+        )  # Record the block
+    return is_blocked_by_website  # Tell the caller whether we were blocked
 
 
-def is_page_unavailable_page(
+def is_page_unavailable_error_page(
     browser_page: Page,
 ) -> bool:  # Check for the "page may no longer exist" error page
     try:  # Reading the page can fail while it is changing
         visible_text = browser_page.inner_text(
-            "body"
-        )  # Read the text a person sees (markup cannot split the sentence)
+            "body", timeout=3000
+        )  # Read the text a person would see; give up after 3 seconds if the page has no body
     except PlaywrightError:  # The page could not be read
         return False  # Assume the page is fine
     normalized_text = re.sub(
         r"\s+", " ", visible_text.lower()
-    )  # Lowercase and squeeze all whitespace to one space
-    message_found = (
+    )  # Lowercase the text and squeeze all whitespace into single spaces
+    error_message_found = (
         PAGE_UNAVAILABLE_MESSAGE in normalized_text
     )  # Look for the known error message
-    if message_found:  # The page is the error page
+    if error_message_found:  # The page is the error page
         download_logger.warning(
             "PAGE UNAVAILABLE message found at %s", browser_page.url
         )  # Record it
-    return message_found  # Tell the caller what we found
+    return error_message_found  # Tell the caller what we found
 
 
 def is_results_page_usable(
-    browser_page: Page, run_statistics: dict
+    browser_page: Page, run_statistics: RunStatistics
 ) -> bool:  # Check a result page before reading it
-    if is_page_unavailable_page(
+    if is_page_unavailable_error_page(
         browser_page
     ):  # Check for the "page may no longer exist" message
         return False  # Skip this page
-    if is_access_denied_page(browser_page):  # Check for the "Access Denied" page
+    if is_access_denied_error_page(browser_page):  # Check for the "Access Denied" page
         register_access_block(
             run_statistics
         )  # Count the block, which may stop the whole run
         return False  # Skip this page
     reset_access_blocks(
         run_statistics
-    )  # The page is fine, so the blocks-in-a-row count restarts
+    )  # The page is fine, so the blocks-in-a-row count starts again
     return True  # The page can be read
 
 
@@ -549,8 +620,8 @@ def wait_for_network_to_settle(
             "networkidle", timeout=20_000
         )  # Wait up to 20 seconds for a quiet network
     except PlaywrightTimeoutError:  # The page kept loading data
-        pass  # Continue anyway
-    time.sleep(2)  # Give the page's JavaScript a little extra time to draw the results
+        pass  # Carry on anyway, the page is probably usable
+    time.sleep(2)  # Give the page's scripts a little extra time to draw the results
 
 
 def dismiss_cookie_banner(
@@ -559,27 +630,27 @@ def dismiss_cookie_banner(
     for accept_selector in (
         "#onetrust-accept-btn-handler",
         "button[id*='accept' i]",
-    ):  # Known accept buttons
+    ):  # Known ways of finding the accept button
         try:  # Ignore any problem finding or clicking the button
             accept_button = browser_page.locator(
                 accept_selector
             ).first  # Find the first matching button
-            if accept_button.is_visible():  # Only click it if it is visible
+            if accept_button.is_visible():  # Only click it if it is really on screen
                 accept_button.click(timeout=3000)  # Accept the cookies
-                time.sleep(0.5)  # Give the popup a moment to close
+                time.sleep(0.5)  # Give the popup a moment to disappear
                 return  # Stop after the first button that worked
-        except PlaywrightError:  # The button was missing or not clickable
-            continue  # Try the next selector
+        except PlaywrightError:  # The button was missing or could not be clicked
+            continue  # Try the next way of finding it
 
 
 def scroll_to_bottom_of_page(
     browser_page: Page, pause_seconds: float = 0.8
-) -> None:  # Load lazy content by scrolling down
-    previous_page_height = 0  # Remember the page height from the previous round
-    for scroll_round in range(15):  # Scroll at most 15 times
+) -> None:  # Scroll down so lazily loaded results appear
+    previous_page_height = 0  # The page height measured in the previous round
+    for _scroll_round in range(15):  # Scroll at most 15 times
         browser_page.evaluate(
             "window.scrollTo(0, document.documentElement.scrollHeight)"
-        )  # Jump to the page bottom
+        )  # Jump to the bottom of the page
         time.sleep(pause_seconds)  # Wait for more content to load
         current_page_height = browser_page.evaluate(
             "document.documentElement.scrollHeight"
@@ -593,43 +664,43 @@ def scroll_to_bottom_of_page(
         )
 
 
-PDF_OR_SDS_LINK_PATTERN = re.compile(
+PDF_OR_SAFETY_DATA_SHEET_LINK_PATTERN = re.compile(
     r"\.pdf(\?|#|$)|msds|/sds|sds[_/\-.]|safety[-_ ]?data", re.IGNORECASE
-)  # Matches links that look like PDFs/SDS
-RAW_PDF_URL_PATTERN = re.compile(
+)  # Matches links that look like PDFs or safety data sheets
+PDF_URL_INSIDE_PAGE_SOURCE_PATTERN = re.compile(
     r"https?://[^\s\"'<>\\]+?\.pdf(?:\?[^\s\"'<>\\]*)?", re.IGNORECASE
-)  # Matches raw .pdf URLs hidden in page source
+)  # Matches .pdf addresses hidden inside the page source
 
 
 def extract_pdf_urls_from_page(
     browser_page: Page,
-) -> set:  # Find every USA English PDF URL on the page
-    found_urls = set()  # Collects the URLs found on this page
-    for link_address in browser_page.evaluate(
+) -> set:  # Find every USA English PDF address on the page
+    found_urls = set()  # Collects the addresses found on this page
+    for link_url in browser_page.evaluate(
         "() => Array.from(document.querySelectorAll('a[href]')).map(linkElement => linkElement.href)"
     ):  # Read the address of every link on the page
-        if link_address.startswith("http") and PDF_OR_SDS_LINK_PATTERN.search(
-            link_address
-        ):  # Looks like a PDF or SDS link
-            found_urls.add(link_address)  # Keep it
+        if link_url.startswith("http") and PDF_OR_SAFETY_DATA_SHEET_LINK_PATTERN.search(
+            link_url
+        ):  # Keep links that look like PDFs or safety data sheets
+            found_urls.add(link_url)  # Remember the link
     page_source_text = browser_page.content().replace(
         "\\/", "/"
-    )  # Page source with JSON-escaped slashes turned back into normal ones
-    for raw_url in RAW_PDF_URL_PATTERN.findall(
+    )  # Page source with JSON-style escaped slashes turned back into normal ones
+    for url_found_in_source in PDF_URL_INSIDE_PAGE_SOURCE_PATTERN.findall(
         page_source_text
-    ):  # Search the raw page source too
+    ):  # Also search the raw page source for hidden PDF addresses
         found_urls.add(
-            raw_url.replace("\\u0026", "&").replace("&amp;", "&")
-        )  # Keep the URL after decoding escaped ampersands
+            url_found_in_source.replace("\\u0026", "&").replace("&amp;", "&")
+        )  # Remember it after decoding escaped ampersands
     usa_english_urls = {
         found_url for found_url in found_urls if is_usa_english_pdf_url(found_url)
-    }  # Keep USA English links only
+    }  # Keep only the USA English files
     download_logger.debug(
         "Found %d PDF link(s), %d after the USA English filter",
         len(found_urls),
         len(usa_english_urls),
-    )  # Record the counts
-    return usa_english_urls  # Give only the USA English URLs back
+    )  # Record how many links were found
+    return usa_english_urls  # Give back only the USA English addresses
 
 
 NEXT_PAGE_BUTTON_SELECTORS = [  # Different ways the "next page" button might be found
@@ -638,15 +709,15 @@ NEXT_PAGE_BUTTON_SELECTORS = [  # Different ways the "next page" button might be
     "li.next:not(.disabled) a",  # A link inside an enabled "next" list item
     "a.next",  # A link with a "next" class
     "button.next",  # A button with a "next" class
-    "[class*='pagination'] [class*='next']",  # A "next" element inside pagination
-    "xpath=//button[normalize-space()='Next' or normalize-space()='>']",  # Button with text Next or >
-    "xpath=//a[normalize-space()='Next' or normalize-space()='>']",  # Link with text Next or >
+    "[class*='pagination'] [class*='next']",  # A "next" element inside a pagination block
+    "xpath=//button[normalize-space()='Next' or normalize-space()='>']",  # A button whose text is Next or >
+    "xpath=//a[normalize-space()='Next' or normalize-space()='>']",  # A link whose text is Next or >
 ]  # End of the selector list
 
 
 def click_next_page_button(
     browser_page: Page,
-) -> bool:  # Go to the next result page if possible
+) -> bool:  # Go to the next page of results if there is one
     for (
         next_button_selector
     ) in NEXT_PAGE_BUTTON_SELECTORS:  # Try each known way of finding the button
@@ -654,201 +725,209 @@ def click_next_page_button(
             next_button_selector
         )  # Find every element matching this selector
         try:  # Counting can fail if the page changes at the wrong moment
-            match_count = matching_locator.count()  # Count the matches
+            match_count = matching_locator.count()  # Count the matching elements
         except PlaywrightError:  # The selector could not be used
             continue  # Try the next selector
-        for match_position in range(match_count):  # Check each candidate by position
-            candidate_button = matching_locator.nth(
-                match_position
-            )  # Pick the candidate
-            try:  # The element may go stale or be covered
+        for match_position in range(match_count):  # Check each match by its position
+            candidate_button = matching_locator.nth(match_position)  # Pick one match
+            try:  # The element may disappear or be covered
                 if (
                     not candidate_button.is_visible()
                     or not candidate_button.is_enabled()
-                ):  # Hidden or disabled
-                    continue  # Skip this candidate
+                ):  # The button is hidden or disabled
+                    continue  # Skip this one
                 if candidate_button.get_attribute(
                     "aria-disabled"
                 ) == "true" or "disabled" in (
                     candidate_button.get_attribute("class") or ""
-                ):  # Other disabled markers
-                    continue  # Skip this candidate
-                human_click_element(
+                ):  # Other ways a button can be marked disabled
+                    continue  # Skip this one
+                click_element_like_a_human(
                     browser_page, candidate_button
                 )  # Move the pointer to the button like a person and click it
                 download_logger.info(
                     "Clicked next page button (%s)", next_button_selector
                 )  # Record the click
-                return True  # Report that we moved to another page
+                return True  # We moved to another page
             except PlaywrightError:  # The click did not work
-                continue  # Try the next candidate
+                continue  # Try the next match
     download_logger.info(
         "No usable next page button found"
     )  # Record that the last page was reached
-    return False  # No usable next page button was found
+    return False  # There is no further page
 
 
 # ============================================================== HUMAN-LIKE BEHAVIOUR
 #
 # Three parts:
-#   1. Links and URLs     -- which links a casual visitor might click
-#   2. Human-like input   -- curved mouse paths, wheel scrolling, random key presses, clicking,
-#                            and pausing with activity instead of sitting still
-#   3. The routine        -- home page first, then three other pages, then scraping starts
+#   1. Links           -- which links an ordinary visitor might click
+#   2. Human-like input -- curved mouse paths, wheel scrolling, random key presses, clicking, and
+#                          pausing with activity instead of sitting still
+#   3. The routine      -- home page first, then a few other pages, then scraping starts
 #
 # Random letters are only pressed, never submitted: Enter and other special keys are never used,
-# and any focused text box is un-focused first, so no new search is ever started.
+# and any focused text box is un-focused first, so no new search is ever started by accident.
 
-# ---------------------------------------------------------------- 1. LINKS AND URLS
+# ---------------------------------------------------------------- 1. LINKS
 
-EXCLUDED_BROWSING_LINK_PATTERN = re.compile(  # Pattern for links a casual visitor would not click
+LINKS_TO_AVOID_WHILE_BROWSING_PATTERN = re.compile(  # Pattern for links an ordinary visitor would not click while browsing
     r"log-?in|log-?out|sign-?in|sign-?out|register|cart|checkout|account"  # Login, logout, sign-in, registration, shopping and account pages
     r"|\.pdf|msds|/sds|mailto:|tel:|javascript:",  # Documents, e-mail, phone and script links
     re.IGNORECASE,  # Ignore capital letters
 )  # End of the pattern
-LINK_CANDIDATES_SCRIPT = (  # JavaScript that describes every link on the page, in page order
+DESCRIBE_ALL_LINKS_SCRIPT = (  # JavaScript that describes every link on the page, in page order
     "() => Array.from(document.querySelectorAll('a[href]')).map((linkElement, linkIndex) => {"  # Go through every link and remember its position
     "const linkBox = linkElement.getBoundingClientRect();"  # Size and position of the link on screen
     "const linkStyle = getComputedStyle(linkElement);"  # How the link is displayed
     "return {"  # Start the description of this link
     "index: linkIndex,"  # Position of the link among all links
     "href: linkElement.href,"  # Full address of the link
-    "visible: linkBox.width > 20 && linkBox.height > 10 && linkStyle.visibility !== 'hidden' && linkStyle.display !== 'none',"  # Is it big enough and shown
-    "new_tab: linkElement.target === '_blank',"  # Does it open a new tab
+    "visible: linkBox.width > 20 && linkBox.height > 10 && linkStyle.visibility !== 'hidden' && linkStyle.display !== 'none',"  # Is the link big enough and shown
+    "new_tab: linkElement.target === '_blank',"  # Does the link open a new tab
     "download: linkElement.hasAttribute('download'),"  # Is it a download link
     "};"  # End of the description of this link
     "})"  # End of the loop over all links
 )  # End of the script
-UNFOCUS_TEXT_BOXES_SCRIPT = (  # JavaScript that takes the keyboard focus away from any text box
-    "() => { const focusedElement = document.activeElement;"  # The element that currently has the focus
+REMOVE_KEYBOARD_FOCUS_FROM_TEXT_BOXES_SCRIPT = (  # JavaScript that takes the keyboard focus away from any text box
+    "() => { const focusedElement = document.activeElement;"  # The element that currently has the keyboard focus
     " if (focusedElement && focusedElement !== document.body && (['INPUT', 'TEXTAREA', 'SELECT'].includes(focusedElement.tagName) || focusedElement.isContentEditable)) focusedElement.blur(); }"  # If it is a text box, take the focus away
 )  # End of the script
 
 
-def without_fragment(page_url: str) -> str:  # Drop the "#section" part of a URL
-    return page_url.split("#")[0]  # Everything before the first "#"
-
-
 def pick_random_internal_link(
     browser_page: Page, visited_urls: set
-) -> Optional[tuple]:  # Choose a random visible Agilent link we have not used
+) -> Optional[tuple]:  # Choose a random visible Agilent link we have not used yet
     candidate_links = []  # Collects (position on the page, address) pairs
     for link_description in browser_page.evaluate(
-        LINK_CANDIDATES_SCRIPT
+        DESCRIBE_ALL_LINKS_SCRIPT
     ):  # Look at every link on the page
-        link_address = link_description["href"]  # The full address of the link
-        parsed_address = urlparse(link_address)  # Split the address into parts
-        host_name = parsed_address.hostname or ""  # The website name, empty if missing
+        link_url = link_description["href"]  # The full address of the link
+        parsed_url = urlparse(link_url)  # Split the address into its parts
+        website_host_name = (
+            parsed_url.hostname or ""
+        )  # The website name, empty if missing
         if (
             not link_description["visible"]
             or link_description["new_tab"]
             or link_description["download"]
         ):  # Hidden, popup or download link
-            continue  # A normal visitor would not click it here
-        if parsed_address.scheme not in ("http", "https"):  # Not a normal web address
+            continue  # An ordinary visitor would not click it here
+        if parsed_url.scheme not in ("http", "https"):  # Not a normal web address
             continue  # Skip it
-        if host_name != "agilent.com" and not host_name.endswith(
+        if website_host_name != "agilent.com" and not website_host_name.endswith(
             ".agilent.com"
-        ):  # Not an Agilent page (so "evilagilent.com" is rejected)
+        ):  # Not an Agilent page (look-alike domains are rejected)
             continue  # Stay on Agilent's own website
-        if EXCLUDED_BROWSING_LINK_PATTERN.search(
-            link_address
-        ):  # Login, cart, PDFs and similar
+        if LINKS_TO_AVOID_WHILE_BROWSING_PATTERN.search(
+            link_url
+        ):  # Login, cart, PDF and similar links
             continue  # Skip it
         if (
-            without_fragment(link_address) in visited_urls
-        ):  # Already visited, or the page we are on
+            remove_fragment_from_url(link_url) in visited_urls
+        ):  # Already visited, or it is the page we are on
             continue  # We want different pages
         candidate_links.append(
-            (link_description["index"], link_address)
+            (link_description["index"], link_url)
         )  # This link is a good candidate
     return (
         random.choice(candidate_links) if candidate_links else None
-    )  # One at random, if any
+    )  # Pick one at random, if there is any
 
 
 # ---------------------------------------------------------------- 2. HUMAN-LIKE INPUT
 
-mouse_position = {
-    "x": 200.0,
-    "y": 200.0,
-}  # Where the pointer is now (Playwright cannot tell us, so we remember it)
+current_mouse_x = 200.0  # Where the pointer is horizontally (Playwright cannot tell us, so we remember it)
+current_mouse_y = 200.0  # Where the pointer is vertically
 
 
-def get_viewport_size(
+def reset_mouse_position() -> None:  # Put the remembered pointer position back to its starting place
+    global current_mouse_x, current_mouse_y  # We change the module-level position variables
+    current_mouse_x, current_mouse_y = (
+        200.0,
+        200.0,
+    )  # A fresh browser starts with the pointer here
+
+
+def get_visible_page_size(
     browser_page: Page,
 ) -> tuple:  # Width and height of the visible page area
-    viewport_size = browser_page.viewport_size or {
-        "width": VIEWPORT_WIDTH_PIXELS,
-        "height": VIEWPORT_HEIGHT_PIXELS,
-    }  # Fall back to full HD
-    return viewport_size["width"], viewport_size["height"]  # Give both numbers back
+    visible_page_size = browser_page.viewport_size or {
+        "width": BROWSER_WINDOW_WIDTH_PIXELS,
+        "height": BROWSER_WINDOW_HEIGHT_PIXELS,
+    }  # Fall back to full HD if the size is unknown
+    return (
+        visible_page_size["width"],
+        visible_page_size["height"],
+    )  # Give both numbers back
 
 
-def human_mouse_move(
-    browser_page: Page, target_x: float, target_y: float
-) -> None:  # Move the pointer along a curved, uneven path
-    viewport_width, viewport_height = get_viewport_size(
+def move_mouse_like_a_human(
+    browser_page: Page, pointer_target_x: float, pointer_target_y: float
+) -> None:  # Move the pointer along a curved, slightly shaky path
+    global current_mouse_x, current_mouse_y  # We update the remembered pointer position at the end
+    visible_page_width, visible_page_height = get_visible_page_size(
         browser_page
     )  # Size of the page area
-    target_x = min(
-        max(target_x, 1), viewport_width - 1
+    pointer_target_x = min(
+        max(pointer_target_x, 1), visible_page_width - 1
     )  # Keep the target inside the page horizontally
-    target_y = min(
-        max(target_y, 1), viewport_height - 1
+    pointer_target_y = min(
+        max(pointer_target_y, 1), visible_page_height - 1
     )  # Keep the target inside the page vertically
-    start_x, start_y = (
-        mouse_position["x"],
-        mouse_position["y"],
+    pointer_start_x, pointer_start_y = (
+        current_mouse_x,
+        current_mouse_y,
     )  # Where the pointer is now
     travel_distance = math.hypot(
-        target_x - start_x, target_y - start_y
+        pointer_target_x - pointer_start_x, pointer_target_y - pointer_start_y
     )  # Straight-line distance to travel
-    if travel_distance < 2:  # Already there
+    if travel_distance < 2:  # The pointer is already there
         return  # Nothing to do
     movement_step_count = max(
         12, min(60, int(travel_distance / 10))
     )  # Longer moves use more small steps
     curve_bend_amount = travel_distance * random.uniform(
         0.1, 0.3
-    )  # How much the path curves
-    control_point_x = (start_x + target_x) / 2 + random.choice(
+    )  # How strongly the path curves
+    control_point_x = (pointer_start_x + pointer_target_x) / 2 + random.choice(
         (-1, 1)
     ) * curve_bend_amount * random.random()  # Curve control point, pulled sideways
-    control_point_y = (start_y + target_y) / 2 + random.choice(
+    control_point_y = (pointer_start_y + pointer_target_y) / 2 + random.choice(
         (-1, 1)
     ) * curve_bend_amount * random.random()  # Curve control point, pulled up or down
-    for step_number in range(1, movement_step_count + 1):  # Walk along the curve
+    for movement_step_number in range(
+        1, movement_step_count + 1
+    ):  # Walk along the curve step by step
         progress_fraction = (
-            step_number / movement_step_count
-        )  # How far along the path we are (0 to 1)
+            movement_step_number / movement_step_count
+        )  # How far along the path we are, from 0 to 1
         eased_progress = (
             progress_fraction * progress_fraction * (3 - 2 * progress_fraction)
         )  # Start slowly, speed up in the middle, slow down at the end
         curve_point_x = (
-            (1 - eased_progress) ** 2 * start_x
+            (1 - eased_progress) ** 2 * pointer_start_x
             + 2 * (1 - eased_progress) * eased_progress * control_point_x
-            + eased_progress**2 * target_x
-        )  # Point on the curve, horizontal
+            + eased_progress**2 * pointer_target_x
+        )  # Horizontal position on the curve
         curve_point_y = (
-            (1 - eased_progress) ** 2 * start_y
+            (1 - eased_progress) ** 2 * pointer_start_y
             + 2 * (1 - eased_progress) * eased_progress * control_point_y
-            + eased_progress**2 * target_y
-        )  # Point on the curve, vertical
-        if step_number < movement_step_count:  # Every step except the last one
+            + eased_progress**2 * pointer_target_y
+        )  # Vertical position on the curve
+        if movement_step_number < movement_step_count:  # Every step except the last one
             curve_point_x += random.uniform(-1.0, 1.0)  # Tiny hand shake, horizontal
             curve_point_y += random.uniform(-1.0, 1.0)  # Tiny hand shake, vertical
         browser_page.mouse.move(
             curve_point_x, curve_point_y
         )  # Move the pointer to this point
         time.sleep(random.uniform(0.004, 0.014))  # Tiny pause between steps
-    mouse_position["x"], mouse_position["y"] = (
-        target_x,
-        target_y,
+    current_mouse_x, current_mouse_y = (
+        pointer_target_x,
+        pointer_target_y,
     )  # Remember where the pointer ended up
 
 
-def human_click_element(
+def click_element_like_a_human(
     browser_page: Page, target_element
 ) -> None:  # Move the pointer to an element like a person and click it
     target_element.scroll_into_view_if_needed(
@@ -860,48 +939,48 @@ def human_click_element(
     if element_box is None:  # The element has no size right now
         target_element.click(timeout=5000)  # Fall back to a normal click
         return  # Done
-    click_x = element_box["x"] + element_box["width"] * random.uniform(
+    click_position_x = element_box["x"] + element_box["width"] * random.uniform(
         0.3, 0.7
-    )  # A spot inside the element, horizontal
-    click_y = element_box["y"] + element_box["height"] * random.uniform(
+    )  # A spot inside the element, horizontally
+    click_position_y = element_box["y"] + element_box["height"] * random.uniform(
         0.3, 0.7
-    )  # A spot inside the element, vertical
-    human_mouse_move(
-        browser_page, click_x, click_y
+    )  # A spot inside the element, vertically
+    move_mouse_like_a_human(
+        browser_page, click_position_x, click_position_y
     )  # Move the pointer there like a person
-    time.sleep(random.uniform(0.2, 0.6))  # Short hesitation before clicking
+    time.sleep(random.uniform(0.2, 0.6))  # Hesitate briefly before clicking
     browser_page.mouse.click(
-        mouse_position["x"], mouse_position["y"], delay=random.randint(50, 150)
-    )  # Click, holding the button briefly
+        current_mouse_x, current_mouse_y, delay=random.randint(50, 150)
+    )  # Click, holding the button down for a moment
 
 
-def human_scroll(
+def scroll_like_a_human(
     browser_page: Page, scroll_pixels: int
 ) -> None:  # Scroll with the mouse wheel in small, uneven notches
     scroll_direction = (
         1 if scroll_pixels > 0 else -1
     )  # Down is positive, up is negative
     remaining_pixels = abs(scroll_pixels)  # How much is still left to scroll
-    while remaining_pixels > 0:  # Keep scrolling until we have covered the distance
-        notch_pixels = min(
+    while remaining_pixels > 0:  # Keep scrolling until the distance is covered
+        wheel_notch_pixels = min(
             remaining_pixels, random.randint(40, 120)
         )  # Size of this wheel notch
         browser_page.mouse.wheel(
-            0, scroll_direction * notch_pixels
+            0, scroll_direction * wheel_notch_pixels
         )  # Turn the wheel a little
-        remaining_pixels -= notch_pixels  # Count it off
+        remaining_pixels -= wheel_notch_pixels  # Count the notch off
         time.sleep(random.uniform(0.02, 0.09))  # Short pause between notches
         if random.random() < 0.08:  # Now and then
-            time.sleep(random.uniform(0.3, 0.9))  # Stop to read for a moment
+            time.sleep(random.uniform(0.3, 0.9))  # Stop for a moment as if reading
 
 
-def human_type_random_letters(
+def press_random_letter_keys_like_a_human(
     browser_page: Page,
 ) -> None:  # Press a few random letter keys with human-like timing
     browser_page.evaluate(
-        UNFOCUS_TEXT_BOXES_SCRIPT
-    )  # No text box may have the focus, so the letters cannot change a search box
-    for key_press_number in range(random.randint(2, 6)):  # A few key presses
+        REMOVE_KEYBOARD_FOCUS_FROM_TEXT_BOXES_SCRIPT
+    )  # No text box may have focus, so the letters cannot change a search box
+    for _key_press_number in range(random.randint(2, 6)):  # Press a few keys
         random_letter = random.choice(
             string.ascii_lowercase
         )  # Pick a random letter a-z (never Enter or other special keys)
@@ -913,46 +992,52 @@ def human_type_random_letters(
             time.sleep(random.uniform(0.4, 1.0))  # Hesitate like someone thinking
 
 
-def act_like_a_person_on_page(
+def act_like_a_human_on_page(
     browser_page: Page, duration_seconds: float
 ) -> None:  # Move the mouse, scroll and press random letters for a while
-    end_time = time.time() + duration_seconds  # Moment when we stop
-    viewport_width, viewport_height = get_viewport_size(
+    activity_end_time = time.time() + duration_seconds  # The moment when we stop
+    visible_page_width, visible_page_height = get_visible_page_size(
         browser_page
     )  # Size of the page area
-    while time.time() < end_time:  # Keep going until the time is up
+    while time.time() < activity_end_time:  # Keep going until the time is up
         try:  # Browser actions can fail while the page is changing
-            action_roll = random.random()  # Pick what to do next
-            if action_roll < 0.2:  # Sometimes
-                human_type_random_letters(browser_page)  # Press a few random letters
-            elif action_roll < 0.55:  # Mostly read the page
-                human_scroll(browser_page, random.randint(200, 650))  # Scroll down
-            elif action_roll < 0.9:  # Often move the mouse somewhere else
-                human_mouse_move(
+            random_action_choice = random.random()  # Pick what to do next
+            if random_action_choice < 0.2:  # Sometimes
+                press_random_letter_keys_like_a_human(
+                    browser_page
+                )  # Press a few random letters
+            elif random_action_choice < 0.55:  # Most often the visitor reads the page
+                scroll_like_a_human(
+                    browser_page, random.randint(200, 650)
+                )  # Scroll down
+            elif (
+                random_action_choice < 0.9
+            ):  # Often the visitor moves the mouse somewhere else
+                move_mouse_like_a_human(
                     browser_page,
-                    random.uniform(40, viewport_width - 40),
-                    random.uniform(40, viewport_height - 40),
+                    random.uniform(40, visible_page_width - 40),
+                    random.uniform(40, visible_page_height - 40),
                 )  # Move to a random spot
-            else:  # Occasionally look back up
-                human_scroll(
+            else:  # Occasionally the visitor looks back up
+                scroll_like_a_human(
                     browser_page, -random.randint(100, 300)
                 )  # Scroll up a little
         except PlaywrightError as browser_error:  # The action did not work
             if is_browser_closed_error(browser_error):  # The browser itself is gone
                 raise  # Let the caller deal with it
-        remaining_seconds = end_time - time.time()  # Time left
-        if remaining_seconds > 0:  # Still time to spend
+        remaining_seconds = activity_end_time - time.time()  # Time left
+        if remaining_seconds > 0:  # There is still time to spend
             time.sleep(
                 min(remaining_seconds, random.uniform(0.5, 2.0))
-            )  # Human-like pause between actions
+            )  # Pause like a person between actions
 
 
-def pause_while_acting_like_a_person(
+def pause_while_acting_like_a_human(
     browser_page: Page,
     minimum_seconds: float,
     maximum_seconds: float,
     pause_reason: str,
-) -> None:  # Wait a random time while acting like a person
+) -> None:  # Wait a random time while still looking active
     pause_seconds = random.uniform(
         minimum_seconds, maximum_seconds
     )  # Pick a random length inside the range
@@ -962,7 +1047,7 @@ def pause_while_acting_like_a_person(
         pause_reason,
     )  # Record the pause and why it happens
     try:  # The browser can fail while we act
-        act_like_a_person_on_page(
+        act_like_a_human_on_page(
             browser_page, pause_seconds
         )  # Move the mouse, scroll and press random letters
     except (
@@ -971,10 +1056,10 @@ def pause_while_acting_like_a_person(
     ) as browser_error:  # The browser had a problem
         download_logger.debug(
             "Activity during the pause failed: %s", str(browser_error).splitlines()[0]
-        )  # Record it
+        )  # Record the problem
         time.sleep(
             pause_seconds
-        )  # Just wait instead, the next step deals with the browser
+        )  # Simply wait instead; the next step deals with the browser
 
 
 # ---------------------------------------------------------------- 3. THE BROWSING ROUTINE
@@ -983,31 +1068,32 @@ def pause_while_acting_like_a_person(
 def open_random_link(
     browser_page: Page, visited_urls: set
 ) -> Optional[str]:  # Click a random link and return the address of the page it opens
-    for attempt_number in range(5):  # Try a few different links if one does not work
+    for _attempt_number in range(
+        5
+    ):  # Try a few different links in case one does not work
         chosen_candidate = pick_random_internal_link(
             browser_page, visited_urls
         )  # Choose a link
-        if chosen_candidate is None:  # No suitable link on this page
+        if chosen_candidate is None:  # There is no suitable link on this page
             return None  # Give up
         (
             link_position,
-            link_address,
-        ) = chosen_candidate  # Position and address of the link
-        visited_urls.add(without_fragment(link_address))  # Never choose this one again
-        address_before_click = without_fragment(browser_page.url)  # Where we are now
+            link_url,
+        ) = chosen_candidate  # Position and address of the chosen link
+        visited_urls.add(
+            remove_fragment_from_url(link_url)
+        )  # Never choose this one again
+        page_url_before_click = remove_fragment_from_url(
+            browser_page.url
+        )  # Where we are right now
         try:  # Clicking can fail
             chosen_link = browser_page.locator("a[href]").nth(
                 link_position
-            )  # Find the link by its position
-            human_click_element(
+            )  # Find the link by its position on the page
+            click_element_like_a_human(
                 browser_page, chosen_link
             )  # Move the pointer to it like a person and click it
-            browser_page.wait_for_url(
-                lambda new_address: without_fragment(new_address)
-                != address_before_click,
-                wait_until="domcontentloaded",
-                timeout=8000,
-            )  # Wait until we really moved to another page
+            browser_page.wait_for_url(lambda new_page_url, previous_page_url=page_url_before_click: remove_fragment_from_url(str(new_page_url)) != previous_page_url, wait_until="domcontentloaded", timeout=8000)  # type: ignore[misc]  # Wait until we really arrived on another page
         except (
             PlaywrightError,
             PlaywrightTimeoutError,
@@ -1015,61 +1101,59 @@ def open_random_link(
             if is_browser_closed_error(browser_error):  # The browser itself is gone
                 raise  # Stop browsing
             download_logger.debug(
-                "Browsing: link %s did not open a page", link_address
+                "Browsing: link %s did not open a page", link_url
             )  # Record it
             continue  # Try another link
-        return browser_page.url  # We are on a new page
+        return browser_page.url  # We are now on a new page
     return None  # None of the links worked
 
 
 def return_to_home_page(
-    browser_page: Page, home_page_address: str
+    browser_page: Page, home_page_url: str
 ) -> None:  # Go back to the home page like a person would
     try:  # Going back can fail
         browser_page.go_back(
             wait_until="domcontentloaded", timeout=15_000
-        )  # Use the back button
+        )  # Press the back button
     except (
         PlaywrightError,
         PlaywrightTimeoutError,
-    ) as browser_error:  # Back did not work
+    ) as browser_error:  # Going back did not work
         if is_browser_closed_error(browser_error):  # The browser itself is gone
             raise  # Stop browsing
-    if without_fragment(browser_page.url) != without_fragment(
-        home_page_address
-    ):  # Not on the home page
+    if remove_fragment_from_url(browser_page.url) != remove_fragment_from_url(
+        home_page_url
+    ):  # We are not on the home page
         browser_page.goto(
-            home_page_address, wait_until="domcontentloaded"
+            home_page_url, wait_until="domcontentloaded"
         )  # Open it directly instead
     time.sleep(random.uniform(1.0, 2.0))  # Let the home page draw itself
 
 
-def browse_like_a_normal_user(
+def browse_like_a_normal_visitor(
     browser_page: Page,
 ) -> None:  # Move around the home page, then open a few different pages from it
     try:  # Any browser problem just ends the browsing early
-        home_page_address = (
-            browser_page.url
-        )  # The page we start from and keep returning to
+        home_page_url = browser_page.url  # The page we start from and keep returning to
         visited_urls = {
-            without_fragment(home_page_address),
-            without_fragment(HOME_PAGE_URL),
-        }  # Pages already seen
+            remove_fragment_from_url(home_page_url),
+            remove_fragment_from_url(HOME_PAGE_URL),
+        }  # Pages that count as already seen
         download_logger.info(
             "Browsing: mouse, scrolling and random keys on the home page for about %d seconds",
             HOME_PAGE_BROWSING_SECONDS,
         )  # Record the first step
-        act_like_a_person_on_page(
+        act_like_a_human_on_page(
             browser_page, HOME_PAGE_BROWSING_SECONDS
         )  # Home page: mouse, scrolling and random letters
         for visit_number in range(
             1, OTHER_PAGES_TO_VISIT + 1
         ):  # Open the other pages one by one
             visit_start_time = time.time()  # When this visit began
-            opened_address = open_random_link(
+            opened_page_url = open_random_link(
                 browser_page, visited_urls
             )  # Click a random link on the home page
-            if opened_address is None:  # No link worked
+            if opened_page_url is None:  # No link worked
                 download_logger.warning(
                     "Browsing: could not open another page, stopping early"
                 )  # Record it
@@ -1079,17 +1163,17 @@ def browse_like_a_normal_user(
                 visit_number,
                 OTHER_PAGES_TO_VISIT,
                 OTHER_PAGE_BROWSING_SECONDS,
-                opened_address,
+                opened_page_url,
             )  # Record the visit
             seconds_left_on_page = max(
                 2.0, OTHER_PAGE_BROWSING_SECONDS - (time.time() - visit_start_time)
-            )  # Rest of this visit's time
-            act_like_a_person_on_page(
+            )  # The rest of this visit's time
+            act_like_a_human_on_page(
                 browser_page, seconds_left_on_page
             )  # Other pages: mouse, scrolling and random letters
             if visit_number < OTHER_PAGES_TO_VISIT:  # Another visit follows
                 return_to_home_page(
-                    browser_page, home_page_address
+                    browser_page, home_page_url
                 )  # Go back to the home page first
     except (
         PlaywrightError,
@@ -1098,7 +1182,7 @@ def browse_like_a_normal_user(
         download_logger.warning(
             "Browsing like a normal visitor ended early: %s",
             str(browser_error).splitlines()[0],
-        )  # Record it, scraping goes on anyway
+        )  # Record it; scraping goes on anyway
         return  # Leave the function
     download_logger.info("Finished browsing like a normal visitor")  # Record the end
 
@@ -1120,16 +1204,16 @@ def warm_up_session_on_home_page(
         return False  # The warm-up failed
     wait_for_network_to_settle(browser_page)  # Let the home page finish loading
     dismiss_cookie_banner(browser_page)  # Accept the cookie popup like a normal visitor
-    if is_access_denied_page(
+    if is_access_denied_error_page(
         browser_page
     ):  # Check whether even the home page is blocked
         download_logger.error(
             "Warm-up: the home page itself shows Access Denied"
         )  # Record the problem
         return False  # The warm-up failed
-    browse_like_a_normal_user(
+    browse_like_a_normal_visitor(
         browser_page
-    )  # Move around the home page and open a few different pages
+    )  # Move around the home page and open a few other pages
     return True  # The warm-up worked
 
 
@@ -1142,17 +1226,17 @@ PAGE_STATUS_FAILED = "failed"  # The page could not be opened at all
 
 
 def open_page_politely(
-    browser_page: Page, page_url: str, run_statistics: dict
-) -> str:  # Open a page, backing off if blocked
-    """Open a page, backing off and retrying through the home page if blocked."""  # Explanation
+    browser_page: Page, page_url: str, run_statistics: RunStatistics
+) -> str:  # Open a page, backing off if the website blocks us
+    """Open a page; if blocked, wait, visit the home page again, and retry a limited number of times."""  # Short description
     for attempt_number in range(
-        1, MAX_ACCESS_DENIED_ATTEMPTS + 1
+        1, MAXIMUM_ACCESS_DENIED_ATTEMPTS + 1
     ):  # Try a limited number of times
         download_logger.info(
             "Opening %s (attempt %d/%d)",
             page_url,
             attempt_number,
-            MAX_ACCESS_DENIED_ATTEMPTS,
+            MAXIMUM_ACCESS_DENIED_ATTEMPTS,
         )  # Record the attempt
         try:  # Opening the page can fail
             browser_page.goto(page_url, wait_until="domcontentloaded")  # Open the page
@@ -1164,71 +1248,79 @@ def open_page_politely(
             )  # Record the error
             return PAGE_STATUS_FAILED  # Give up on this page
         wait_for_network_to_settle(browser_page)  # Wait for the page to finish loading
-        if is_page_unavailable_page(
+        if is_page_unavailable_error_page(
             browser_page
         ):  # Check for the "page may no longer exist" message
             return PAGE_STATUS_UNAVAILABLE  # Skip this page, retrying will not help
-        if not is_access_denied_page(
+        if not is_access_denied_error_page(
             browser_page
         ):  # Check whether the website let us in
-            reset_access_blocks(run_statistics)  # The blocks-in-a-row count restarts
+            reset_access_blocks(
+                run_statistics
+            )  # The blocks-in-a-row count starts again
             return PAGE_STATUS_OPENED  # The page opened normally
         register_access_block(
             run_statistics
         )  # Count the block, which may stop the whole run
         if (
-            attempt_number < MAX_ACCESS_DENIED_ATTEMPTS
-        ):  # Check whether another attempt is allowed
+            attempt_number < MAXIMUM_ACCESS_DENIED_ATTEMPTS
+        ):  # Another attempt is still allowed
             backoff_seconds = ACCESS_DENIED_BACKOFF_SECONDS * (
                 2 ** (attempt_number - 1)
             ) + random.uniform(
                 0, 5
-            )  # Longer each time
+            )  # Wait longer after every block
             download_logger.info(
                 "Backing off for %.0f seconds, then revisiting the home page",
                 backoff_seconds,
-            )  # Explain
+            )  # Explain the wait
             time.sleep(backoff_seconds)  # Wait before trying again
             warm_up_session_on_home_page(
                 browser_page
             )  # Visit the home page again to refresh the session
     download_logger.error(
-        "Still blocked after %d attempt(s): %s", MAX_ACCESS_DENIED_ATTEMPTS, page_url
+        "Still blocked after %d attempt(s): %s",
+        MAXIMUM_ACCESS_DENIED_ATTEMPTS,
+        page_url,
     )  # Record the failure
     return PAGE_STATUS_BLOCKED  # The page could not be opened
 
 
 # ============================================================== DOWNLOADING
 
-OUTCOME_DOWNLOAD_STARTED = "download started"  # The browser started downloading a file
-OUTCOME_PAGE_UNAVAILABLE = (
+DOWNLOAD_OUTCOME_STARTED = "download started"  # The browser started downloading a file
+DOWNLOAD_OUTCOME_PAGE_UNAVAILABLE = (
     "page unavailable"  # The link led to the "page may no longer exist" message
 )
-OUTCOME_ACCESS_DENIED = "access denied"  # The link led to the "Access Denied" page
-OUTCOME_NOT_A_DOWNLOAD = (
-    "not a download"  # The link led to some other web page instead of a file
+DOWNLOAD_OUTCOME_ACCESS_DENIED = (
+    "access denied"  # The link led to the "Access Denied" page
 )
-OUTCOME_TIMEOUT = "timeout"  # Nothing happened before the time limit
+DOWNLOAD_OUTCOME_NOT_A_DOWNLOAD = (
+    "not a download"  # The link led to an ordinary web page instead of a file
+)
+DOWNLOAD_OUTCOME_TIMED_OUT = "timeout"  # Nothing happened before the time limit
 
 
-def start_download(
+def start_browser_download(
     browser_page: Page, source_url: str
 ) -> tuple:  # Ask the browser to download one URL
-    """Navigate to a URL and wait for the browser to report a download, or classify what happened instead."""  # Explanation
-    received_downloads = []  # Collects the Download objects as the browser reports them
+    """Open a URL and wait for the browser to report a download, or work out what else happened."""  # Short description
+    first_started_download = None  # Will hold the first download the browser reports
 
-    def collect_started_download(
+    def remember_first_download(
         started_download: Download,
-    ) -> None:  # Handler must be a normal function
-        received_downloads.append(started_download)  # Remember the download
+    ) -> None:  # Called by the browser whenever a download starts
+        nonlocal first_started_download  # We change the variable that belongs to the outer function
+        if first_started_download is None:  # Only the first download matters
+            first_started_download = started_download  # Remember it
 
     browser_page.on(
-        "download", collect_started_download
+        "download", remember_first_download
     )  # Start listening for downloads on this tab
     try:  # Make sure the listener is always removed again
-        try:  # Opening a download link can raise an error, which is normal
+        try:  # Opening a download link raises an error, which is normal
             navigation_response = browser_page.goto(
-                source_url, wait_until="commit", timeout=NAVIGATION_TIMEOUT_MS
+                source_url, wait_until="commit", timeout=PAGE_LOAD_TIMEOUT_MILLISECONDS
             )  # Open the link
         except PlaywrightError as navigation_error:  # The browser reported an error for the navigation
             if "Download is starting" in str(
@@ -1237,7 +1329,7 @@ def start_download(
                 navigation_error
             ):  # Expected when the link turns into a download
                 navigation_response = (
-                    None  # The navigation turned straight into a download
+                    None  # The navigation became a download straight away
                 )
             else:  # Some other, real error
                 raise  # Let the calling code handle it
@@ -1246,53 +1338,59 @@ def start_download(
             navigation_response is not None
             and "text/html"
             in navigation_response.headers.get("content-type", "").lower()
-        ):  # The server returned a web page
+        ):  # The server answered with a web page
             try:  # Waiting for the page can time out
                 browser_page.wait_for_load_state(
                     "domcontentloaded", timeout=15_000
                 )  # Let the page finish loading
             except PlaywrightTimeoutError:  # The page took too long
-                pass  # Continue with whatever loaded
-            if is_page_unavailable_page(
+                pass  # Continue with whatever has loaded
+            if is_page_unavailable_error_page(
                 browser_page
             ):  # Check for the "page may no longer exist" message
-                return None, OUTCOME_PAGE_UNAVAILABLE  # No PDF exists at this address
-            if is_access_denied_page(
+                return (
+                    None,
+                    DOWNLOAD_OUTCOME_PAGE_UNAVAILABLE,
+                )  # No PDF exists at this address
+            if is_access_denied_error_page(
                 browser_page
             ):  # Check for the "Access Denied" page
-                return None, OUTCOME_ACCESS_DENIED  # The website blocked this request
-            return None, OUTCOME_NOT_A_DOWNLOAD  # Some other web page, not a file
+                return (
+                    None,
+                    DOWNLOAD_OUTCOME_ACCESS_DENIED,
+                )  # The website blocked this request
+            return (
+                None,
+                DOWNLOAD_OUTCOME_NOT_A_DOWNLOAD,
+            )  # Some other web page, not a file
 
-        wait_deadline = (
-            time.time() + DOWNLOAD_TIMEOUT_MS / 1000
-        )  # Moment when we give up waiting
+        download_wait_deadline = (
+            time.time() + DOWNLOAD_START_TIMEOUT_MILLISECONDS / 1000
+        )  # The moment when we give up waiting
         while (
-            not received_downloads and time.time() < wait_deadline
+            first_started_download is None and time.time() < download_wait_deadline
         ):  # Wait for the browser to report the download
             browser_page.wait_for_timeout(
                 200
             )  # Wait a moment while Playwright processes browser events
-        if received_downloads:  # The browser reported a download
-            return (
-                received_downloads[0],
-                OUTCOME_DOWNLOAD_STARTED,
-            )  # Hand back the download
-        return None, OUTCOME_TIMEOUT  # Nothing happened in time
+        if first_started_download is not None:  # The browser reported a download
+            return first_started_download, DOWNLOAD_OUTCOME_STARTED  # Hand it back
+        return None, DOWNLOAD_OUTCOME_TIMED_OUT  # Nothing happened in time
     finally:  # Always runs, even after an error
         browser_page.remove_listener(
-            "download", collect_started_download
+            "download", remember_first_download
         )  # Stop listening for downloads
 
 
-def download_pdf_urls(
+def download_pdf_files_from_urls(
     download_page: Page,
-    database: DownloadDatabase,
+    download_database: DownloadDatabase,
     urls_to_download: list,
-    run_statistics: dict,
+    run_statistics: RunStatistics,
     internet_monitor: "InternetMonitor",
-    activity_page: Page,
+    page_for_mouse_activity: Page,
 ) -> None:  # Download a batch of URLs
-    """Download each URL in turn on the given (temporary) tab; mouse and key activity happens on the results tab."""  # Explanation
+    """Download each URL in turn on the temporary tab; mouse and key activity happens on the results tab."""  # Short description
     already_contacted_website = (
         False  # Tracks whether we already contacted the website in this batch
     )
@@ -1302,115 +1400,119 @@ def download_pdf_urls(
         download_logger.info(
             "(%d/%d) Processing %s", url_position, len(urls_to_download), source_url
         )  # Record the progress
-        internet_monitor.raise_if_internet_down()  # Stop here and wait if the internet is down
+        internet_monitor.raise_error_if_internet_is_down()  # Stop here and wait if the internet is down
 
-        if database.is_url_already_downloaded_by_name(
+        if download_database.is_file_for_url_already_downloaded(
             source_url
-        ):  # Skip when the predicted file already exists
+        ):  # Skip the URL when its file already exists
             download_logger.info(
                 "  SKIP: the file for this URL already exists"
             )  # Explain the skip
-            database.mark_url_processed(source_url)  # Remember this URL is finished
-            run_statistics["skipped"] += 1  # Count the skip
+            download_database.mark_url_processed(
+                source_url
+            )  # Remember that this URL is finished
+            run_statistics.skipped_count += 1  # Count the skip
             continue  # Move on to the next URL
 
         if already_contacted_website:  # Only pause between two real requests
-            activity_page.bring_to_front()  # Show the results tab, a hidden tab would look odd to the website
-            pause_while_acting_like_a_person(
-                activity_page, *PAUSE_BETWEEN_DOWNLOADS, "between downloads"
-            )  # Move the mouse, scroll and press random letters instead of sitting still
+            page_for_mouse_activity.bring_to_front()  # Show the results tab, because a hidden tab would look odd to the website
+            pause_while_acting_like_a_human(
+                page_for_mouse_activity,
+                *PAUSE_SECONDS_RANGE_BETWEEN_DOWNLOADS,
+                "between downloads",
+            )  # Move the mouse and scroll instead of sitting still
         already_contacted_website = True  # From now on we have contacted the website
 
         try:  # Starting a download can raise browser errors
-            started_download, download_outcome = start_download(
+            started_download, download_outcome = start_browser_download(
                 download_page, source_url
-            )  # Let the browser download it
+            )  # Let the browser download the file
         except PlaywrightError as browser_error:  # A real browser error happened
             if is_browser_closed_error(
                 browser_error
             ):  # Check whether the browser itself has closed
-                raise  # Let the restart logic deal with it, this URL stays pending
+                raise  # Let the restart logic deal with it; this URL stays pending
             if (
-                internet_monitor.confirm_internet_down()
-            ):  # Check whether the internet being down caused the error
+                internet_monitor.confirm_internet_is_down()
+            ):  # Check whether a lost internet connection caused the error
                 raise InternetOutageError(
                     "The internet went down while downloading"
-                )  # Wait for it, this URL stays pending
+                ) from browser_error  # Wait for it; this URL stays pending
             download_logger.error(
                 "  FAILED to open %s: %s",
                 source_url,
                 str(browser_error).splitlines()[0],
-            )  # Record it
-            run_statistics["failed"] += 1  # Count the failure
+            )  # Record the failure
+            run_statistics.failed_count += 1  # Count the failure
             continue  # Move on to the next URL
 
         if (
-            download_outcome == OUTCOME_PAGE_UNAVAILABLE
+            download_outcome == DOWNLOAD_OUTCOME_PAGE_UNAVAILABLE
         ):  # The link led to the "page may no longer exist" message
             download_logger.warning(
                 "  SKIP: page unavailable, no PDF at %s", source_url
             )  # Explain the skip
-            database.mark_url_processed(source_url)  # Never try this URL again
-            run_statistics["unavailable"] += 1  # Count it as unavailable
+            download_database.mark_url_processed(source_url)  # Never try this URL again
+            run_statistics.unavailable_count += 1  # Count it as unavailable
             reset_access_blocks(
                 run_statistics
-            )  # The website answered normally, so the blocks-in-a-row count restarts
+            )  # The website answered normally, so the blocks-in-a-row count starts again
             continue  # Move on to the next URL
         if (
-            download_outcome == OUTCOME_ACCESS_DENIED
+            download_outcome == DOWNLOAD_OUTCOME_ACCESS_DENIED
         ):  # The website blocked this request
             download_logger.error(
                 "  FAILED: access denied for %s", source_url
             )  # Record the failure
-            run_statistics["failed"] += 1  # Count the failure
+            run_statistics.failed_count += 1  # Count the failure
             register_access_block(
                 run_statistics
             )  # Count the block, which may stop the whole run
             continue  # Move on to the next URL
         if (
-            download_outcome == OUTCOME_NOT_A_DOWNLOAD
+            download_outcome == DOWNLOAD_OUTCOME_NOT_A_DOWNLOAD
         ):  # The link is an ordinary web page, not a PDF
             download_logger.warning(
                 "  SKIP: the link is a web page, not a PDF: %s", source_url
             )  # Explain the skip
-            database.mark_url_processed(source_url)  # Never try this URL again
-            run_statistics["skipped"] += 1  # Count it as skipped
+            download_database.mark_url_processed(source_url)  # Never try this URL again
+            run_statistics.skipped_count += 1  # Count it as skipped
             reset_access_blocks(
                 run_statistics
-            )  # The website answered normally, so the blocks-in-a-row count restarts
+            )  # The website answered normally, so the blocks-in-a-row count starts again
             continue  # Move on to the next URL
         if started_download is None:  # The browser never produced a download
             if (
-                internet_monitor.confirm_internet_down()
-            ):  # Check whether the internet being down is the reason
+                internet_monitor.confirm_internet_is_down()
+            ):  # Check whether a lost internet connection is the reason
                 raise InternetOutageError(
                     "The internet went down while downloading"
-                )  # Wait for it, this URL stays pending
+                )  # Wait for it; this URL stays pending
             download_logger.error(
                 "  FAILED: no download (%s) for %s", download_outcome, source_url
             )  # Record the failure
-            run_statistics["failed"] += 1  # Count the failure
+            run_statistics.failed_count += 1  # Count the failure
             continue  # Move on to the next URL
         reset_access_blocks(
             run_statistics
-        )  # A download started, so the blocks-in-a-row count restarts
+        )  # A download started, so the blocks-in-a-row count starts again
 
-        finish_download(
-            started_download, source_url, database, run_statistics
-        )  # Validate, name and save the finished download
+        check_and_save_finished_download(
+            started_download, source_url, download_database, run_statistics
+        )  # Check, name and save the finished download
 
     log_run_statistics(
         run_statistics, "Totals so far"
     )  # Show the totals after this batch
 
 
-def finish_download(
+def check_and_save_finished_download(
     started_download: Download,
     source_url: str,
-    database: DownloadDatabase,
-    run_statistics: dict,
-) -> None:  # Validate and save a completed download
-    """Validate, name, de-duplicate and save a download that the browser already started."""  # Explanation
+    download_database: DownloadDatabase,
+    run_statistics: RunStatistics,
+) -> None:  # Check and save a completed download
+    """Check that the file is a real PDF, give it a clean name, skip duplicates, and save it."""  # Short description
     suggested_file_name = (
         started_download.suggested_filename
     )  # The file name the browser would have used
@@ -1420,21 +1522,21 @@ def finish_download(
     if download_failure:  # The browser reported that the download failed
         download_logger.error(
             "  FAILED: browser download error '%s' for %s", download_failure, source_url
-        )  # Log the failure
-        run_statistics["failed"] += 1  # Count the failure
-        return  # Stop here, nothing more to do
+        )  # Record the failure
+        run_statistics.failed_count += 1  # Count the failure
+        return  # Nothing more to do
 
     with open(
         started_download.path(), "rb"
-    ) as downloaded_file:  # Open the downloaded file for reading
-        file_start_bytes = downloaded_file.read(4)  # Read the first four bytes
+    ) as downloaded_file_handle:  # Open the downloaded file for reading
+        file_start_bytes = downloaded_file_handle.read(4)  # Read its first four bytes
     if file_start_bytes != b"%PDF":  # Real PDF files always start with %PDF
         download_logger.error(
             "  FAILED: downloaded file is not a PDF: %s", source_url
         )  # Record the problem
         started_download.delete()  # Throw the file away
-        run_statistics["failed"] += 1  # Count the failure
-        return  # Stop here, nothing more to do
+        run_statistics.failed_count += 1  # Count the failure
+        return  # Nothing more to do
 
     safe_file_name = build_safe_file_name(
         suggested_file_name
@@ -1443,44 +1545,51 @@ def finish_download(
         DOWNLOAD_FOLDER / safe_file_name
     )  # Full path where the PDF will be saved
     if (
-        database.is_file_name_downloaded(safe_file_name) or safe_file_path.exists()
-    ):  # Decide whether this file name is already saved
+        download_database.is_file_name_already_saved(safe_file_name)
+        or safe_file_path.exists()
+    ):  # Check whether this file name is already saved
         download_logger.info(
             "  DUPLICATE file name, not saved: %s", safe_file_name
         )  # Explain what happens
         started_download.delete()  # Discard the extra copy
-        database.mark_url_processed(source_url)  # Remember this URL is finished
-        run_statistics["skipped"] += 1  # Count it as skipped
-        return  # Stop here, nothing more to do
+        download_database.mark_url_processed(
+            source_url
+        )  # Remember that this URL is finished
+        run_statistics.skipped_count += 1  # Count it as skipped
+        return  # Nothing more to do
 
     started_download.save_as(safe_file_path)  # Save the PDF into the PDFs folder
-    database.record_downloaded_file(
+    download_database.record_saved_file(
         safe_file_name, source_url
-    )  # Save the file name in the database
-    database.mark_url_processed(source_url)  # Remember this URL is finished
-    run_statistics["downloaded"] += 1  # Count the success
+    )  # Write the file name into the database
+    download_database.mark_url_processed(
+        source_url
+    )  # Remember that this URL is finished
+    run_statistics.downloaded_count += 1  # Count the success
     download_logger.info(
         "  SAVED: %s (%d bytes)", safe_file_path, safe_file_path.stat().st_size
     )  # Record the result
 
 
-def download_pdf_urls_in_temporary_tab(
+def download_pdf_files_using_temporary_tab(
     browser_session: "BrowserSession",
-    database: DownloadDatabase,
+    download_database: DownloadDatabase,
     urls_to_download: list,
-    run_statistics: dict,
-) -> None:  # Download, opening a tab only if needed
-    """Pre-filter already-downloaded URLs, then open the download tab only if something is left to do."""  # Explanation
+    run_statistics: RunStatistics,
+) -> None:  # Download, opening a second tab only when needed
+    """Skip files that already exist, then open the download tab only if something is left to do."""  # Short description
     urls_still_needed = []  # Collects the URLs whose files are really missing
     for source_url in urls_to_download:  # Check each URL before opening any tab
-        if database.is_url_already_downloaded_by_name(
+        if download_database.is_file_for_url_already_downloaded(
             source_url
         ):  # The file already exists
             download_logger.info(
                 "  SKIP: the file for %s already exists", source_url
             )  # Explain the skip
-            database.mark_url_processed(source_url)  # Remember this URL is finished
-            run_statistics["skipped"] += 1  # Count the skip
+            download_database.mark_url_processed(
+                source_url
+            )  # Remember that this URL is finished
+            run_statistics.skipped_count += 1  # Count the skip
         else:  # The file is missing
             urls_still_needed.append(source_url)  # Keep the URL for downloading
     if not urls_still_needed:  # Check whether anything is left to download
@@ -1488,83 +1597,90 @@ def download_pdf_urls_in_temporary_tab(
             "Nothing to download in this batch, so no second tab is opened"
         )  # Record the decision
         return  # Leave without opening a tab
-    browser_session.internet_monitor.raise_if_internet_down()  # Do not open a tab while the internet is down
+    browser_session.internet_monitor.raise_error_if_internet_is_down()  # Do not open a tab while the internet is down
     with browser_session.temporary_download_tab() as download_page:  # Open the second tab and close it afterwards
-        download_pdf_urls(
+        download_pdf_files_from_urls(
             download_page,
-            database,
+            download_database,
             urls_still_needed,
             run_statistics,
             browser_session.internet_monitor,
-            browser_session.results_page,
+            browser_session.active_results_page,
         )  # Download the missing files
 
 
 # ============================================================== SCRAPING
 
 
-def collect_and_download_pdf_urls_for_keyword(
+def search_one_keyword_and_download_pdfs(
     browser_session: "BrowserSession",
-    database: DownloadDatabase,
+    download_database: DownloadDatabase,
     search_keyword: str,
-    run_statistics: dict,
-) -> None:  # Scrape one keyword
+    run_statistics: RunStatistics,
+) -> bool:  # Search one keyword; returns True when it was searched
     results_page = (
-        browser_session.results_page
+        browser_session.active_results_page
     )  # The tab used for browsing the search results
-    browser_session.internet_monitor.raise_if_internet_down()  # Wait for the internet before opening the search page
+    browser_session.close_unneeded_tabs()  # Start every keyword with only the results tab open
+    browser_session.internet_monitor.raise_error_if_internet_is_down()  # Wait for the internet before opening the search page
     search_url = SEARCH_URL_TEMPLATE.format(
         search_keyword=search_keyword
     )  # Build the search address
     download_logger.info(
         "Opening search page for keyword '%s': %s", search_keyword, search_url
-    )  # Record it
+    )  # Record what we are about to open
 
     page_status = open_page_politely(
         results_page, search_url, run_statistics
     )  # Open the page, backing off if blocked
     if (
         page_status == PAGE_STATUS_FAILED
-        and browser_session.internet_monitor.confirm_internet_down()
-    ):  # No internet?
+        and browser_session.internet_monitor.confirm_internet_is_down()
+    ):  # The page failed because the internet is down
         raise InternetOutageError(
             "The internet went down while opening the search page"
         )  # Wait for it, then retry
     if page_status != PAGE_STATUS_OPENED:  # Check whether the page opened normally
         download_logger.warning(
-            "[%s] skipping this keyword (page status: %s)", search_keyword, page_status
+            "[%s] skipping this keyword for now (page status: %s)",
+            search_keyword,
+            page_status,
         )  # Explain the skip
-        return  # Nothing was collected, so go on to the next keyword
-    dismiss_cookie_banner(results_page)  # Close the cookie popup if present
-    pause_while_acting_like_a_person(
+        return False  # Nothing was collected; the keyword will be retried at the end
+    dismiss_cookie_banner(results_page)  # Close the cookie popup if it is present
+    pause_while_acting_like_a_human(
         results_page,
-        *ACTIVITY_AFTER_OPENING_SEARCH_PAGE,
+        *ACTIVITY_SECONDS_RANGE_AFTER_OPENING_SEARCH_PAGE,
         "after opening the search page",
-    )  # Move the mouse, scroll and press random letters before reading the results
+    )  # Move the mouse and scroll before reading the results
 
-    all_keyword_urls = set()  # Collects the URLs from every result page of this keyword
+    all_keyword_urls: set[
+        str
+    ] = set()  # Collects the URLs from every result page of this keyword
     for page_number in range(
         1, MAXIMUM_RESULT_PAGES_PER_KEYWORD + 1
     ):  # Walk through the result pages
         browser_session.close_unneeded_tabs()  # Close any tab other than the results and download tabs
-        browser_session.internet_monitor.raise_if_internet_down()  # Stop here and wait if the internet is down
+        browser_session.internet_monitor.raise_error_if_internet_is_down()  # Stop here and wait if the internet is down
         results_page.bring_to_front()  # Keep the results tab in front
         if page_number > 1:  # A next result page has just opened
-            pause_while_acting_like_a_person(
+            pause_while_acting_like_a_human(
                 results_page,
-                *ACTIVITY_AFTER_OPENING_SEARCH_PAGE,
+                *ACTIVITY_SECONDS_RANGE_AFTER_OPENING_SEARCH_PAGE,
                 "after opening a result page",
-            )  # Move the mouse, scroll and press random letters before reading the results
+            )  # Move the mouse and scroll before reading the results
         scroll_to_bottom_of_page(
             results_page
-        )  # Make sure all results on this page are loaded
+        )  # Make sure every result on this page has loaded
 
         urls_on_this_page = extract_pdf_urls_from_page(
             results_page
-        )  # Read the URLs from this page
-        new_urls = urls_on_this_page - all_keyword_urls  # Work out which ones are new
+        )  # Read the PDF addresses from this page
+        new_urls = (
+            urls_on_this_page - all_keyword_urls
+        )  # Work out which ones we have not seen for this keyword
         all_keyword_urls |= (
-            urls_on_this_page  # Add this page's URLs to the keyword total
+            urls_on_this_page  # Add this page's addresses to the keyword total
         )
         download_logger.info(
             "[%s] page %d: %d link(s), %d new, %d total",
@@ -1576,29 +1692,36 @@ def collect_and_download_pdf_urls_for_keyword(
         )  # Show progress
 
         if new_urls:  # Only touch the database when there is something new
-            database.save_new_urls(new_urls)  # Store the new URLs in the database
-            urls_pending_download = database.filter_unprocessed(
+            download_database.save_newly_found_urls(
+                new_urls
+            )  # Store the new addresses in the database
+            urls_pending_download = download_database.keep_only_unprocessed_urls(
                 sorted(new_urls)
-            )  # Work out which of them are still pending
+            )  # Work out which of them still need downloading
             download_logger.info(
                 "[%s] page %d: downloading %d PDF(s) right away",
                 search_keyword,
                 page_number,
                 len(urls_pending_download),
             )  # Say what happens next
-            download_pdf_urls_in_temporary_tab(
-                browser_session, database, urls_pending_download, run_statistics
+            download_pdf_files_using_temporary_tab(
+                browser_session,
+                download_database,
+                urls_pending_download,
+                run_statistics,
             )  # Download them now
 
         if page_number > 1 and not new_urls:  # Check whether paging gave us nothing new
             download_logger.info(
                 "[%s] no new links on this page, stopping", search_keyword
             )  # Explain why we stop
-            break  # Stop, we are probably seeing the same page again
+            break  # Stop, because we are probably seeing the same page again
 
-        pause_while_acting_like_a_person(
-            results_page, *PAUSE_BETWEEN_RESULT_PAGES, "before the next result page"
-        )  # Move the mouse, scroll and press random letters instead of sitting still
+        pause_while_acting_like_a_human(
+            results_page,
+            *PAUSE_SECONDS_RANGE_BETWEEN_RESULT_PAGES,
+            "before the next result page",
+        )  # Move the mouse and scroll instead of sitting still
         results_page.bring_to_front()  # Return to the results tab before looking for the next page button
         if not click_next_page_button(results_page):  # Try to go to the next page
             break  # There is no next page, so this keyword is finished
@@ -1615,7 +1738,10 @@ def collect_and_download_pdf_urls_for_keyword(
 
     download_logger.info(
         "[%s] finished with %d PDF link(s)", search_keyword, len(all_keyword_urls)
-    )  # Keyword summary
+    )  # Summarise the keyword
+    del all_keyword_urls  # Release the memory held by this keyword's address set
+    browser_session.close_unneeded_tabs()  # The keyword is done, so close anything that is not needed
+    return True  # The keyword was searched
 
 
 # ============================================================== INTERNET MONITOR
@@ -1651,38 +1777,63 @@ def is_host_responding(
                 "-c",
                 "1",
                 host_address,
-            ]  # One ping, time limit enforced by subprocess.run below
+            ]  # One ping; the time limit is enforced by subprocess.run below
         try:  # Running ping can fail or take too long
             ping_result = subprocess.run(
                 ping_command,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
                 timeout=PING_TIMEOUT_SECONDS + 2,
+                check=False,
             )  # Run ping quietly
-            if ping_result.returncode == 0:  # Exit code 0 means it answered
+            if ping_result.returncode == 0:  # Exit code 0 means the host answered
                 return True  # The host responded
         except (
             subprocess.TimeoutExpired,
             OSError,
         ):  # Ping took too long or could not run
-            pass  # Fall through to the TCP fallback
+            pass  # Fall through to the plain connection test
     try:  # Some networks block ping, so also try a plain connection
         with socket.create_connection(
-            (host_address, TCP_FALLBACK_PORT), timeout=TCP_FALLBACK_TIMEOUT_SECONDS
-        ):  # Connect
+            (host_address, FALLBACK_CONNECTION_TEST_PORT),
+            timeout=FALLBACK_CONNECTION_TEST_TIMEOUT_SECONDS,
+        ):  # Connect to the host
             return True  # The connection worked, so the host responded
     except OSError:  # The connection did not work
         return False  # The host did not respond
 
 
+async def check_one_host_in_background(
+    host_address: str,
+) -> bool:  # Check one host in a helper thread so several can run together
+    return await asyncio.to_thread(
+        is_host_responding, host_address
+    )  # Wait for the blocking check without freezing the event loop
+
+
+async def check_all_hosts_at_once() -> bool:  # Check every host in parallel and report whether any answered
+    host_responded_flags = await asyncio.gather(
+        *(
+            check_one_host_in_background(host_address)
+            for host_address in INTERNET_CHECK_HOSTS
+        )
+    )  # Start all checks together and wait for all of them
+    return any(host_responded_flags)  # One answer is enough to prove the internet works
+
+
 def check_internet_connection() -> bool:  # The internet works when at least one address answers
-    return any(
-        is_host_responding(host_address) for host_address in INTERNET_CHECK_HOSTS
-    )  # One answer is enough
+    # Playwright's sync API may already own an event loop in the main thread, so the async check
+    # always runs in its own short-lived thread, where asyncio.run() is safe.
+    with ThreadPoolExecutor(
+        max_workers=1
+    ) as single_worker_pool:  # A pool with exactly one fresh thread
+        return single_worker_pool.submit(
+            asyncio.run, check_all_hosts_at_once()
+        ).result()  # Run the async check there and wait for its answer
 
 
 class InternetMonitor:  # Checks the internet in a background thread and tells the session when it goes down
-    """Watches the internet in a background thread and flags the browser for restarting on an outage."""  # Explanation
+    """Watches the internet in a background thread and flags the browser for a restart after an outage."""  # Short description
 
     def __init__(self):  # Prepare the shared state
         self.internet_available_event = (
@@ -1691,13 +1842,11 @@ class InternetMonitor:  # Checks the internet in a background thread and tells t
         self.stop_requested_event = (
             threading.Event()
         )  # Set when the monitor should stop
-        self.state_lock = (
+        self.internet_state_lock = (
             threading.Lock()
         )  # Prevents two threads from changing the state at the same time
-        self.outage_callback = (
-            None  # Function that is called when the internet goes down
-        )
-        self.outage_occurred = (
+        self.outage_callback = None  # Function called when the internet goes down
+        self.internet_outage_occurred = (
             False  # True when the browser must be restarted because of an outage
         )
         self.monitor_thread = None  # The background thread
@@ -1709,47 +1858,51 @@ class InternetMonitor:  # Checks the internet in a background thread and tells t
         if check_internet_connection():  # First check, done right now
             self.internet_available_event.set()  # The internet works
             download_logger.info("Internet check: the internet is working")  # Record it
-        else:  # No answer from either address
+        else:  # No answer from any address
             download_logger.warning(
                 "Internet check: no answer yet, waiting for the internet"
-            )  # Say so
+            )  # Record it
         self.monitor_thread = threading.Thread(
-            target=self._run_check_loop, name="internet-monitor", daemon=True
+            target=self._keep_checking_internet, name="internet-monitor", daemon=True
         )  # Create the monitor thread
         self.monitor_thread.start()  # Start checking in the background
 
     def stop_monitoring(self) -> None:  # Stop the background thread
         self.stop_requested_event.set()  # Ask the thread to finish
-        if self.monitor_thread:  # Check whether it was started
+        if self.monitor_thread:  # Check whether it was ever started
             self.monitor_thread.join(timeout=15)  # Wait a little for it to finish
 
-    def _run_check_loop(self) -> None:  # The work done by the background thread
+    def _keep_checking_internet(self) -> None:  # The work done by the background thread
         while (
             not self.stop_requested_event.is_set()
         ):  # Keep going until we are told to stop
-            self.update_internet_state(
+            self.update_internet_status(
                 check_internet_connection()
             )  # Check the internet and react to any change
             self.stop_requested_event.wait(
                 INTERNET_CHECK_INTERVAL_SECONDS
             )  # Sleep, but wake up early when stopping
 
-    def update_internet_state(
-        self, internet_works: bool
+    def update_internet_status(
+        self, internet_is_working: bool
     ) -> None:  # React when the internet goes down or comes back
         internet_just_went_down = (
             False  # Becomes True when the internet has just gone down
         )
-        with self.state_lock:  # Only one thread may change the state at a time
-            was_available = (
+        with self.internet_state_lock:  # Only one thread may change the state at a time
+            internet_was_available = (
                 self.internet_available_event.is_set()
             )  # What we believed until now
-            if internet_works and not was_available:  # The internet came back
+            if (
+                internet_is_working and not internet_was_available
+            ):  # The internet came back
                 self.internet_available_event.set()  # Record that it works again
                 download_logger.warning("INTERNET IS BACK")  # Tell the user
-            elif not internet_works and was_available:  # The internet just went down
+            elif (
+                not internet_is_working and internet_was_available
+            ):  # The internet just went down
                 self.internet_available_event.clear()  # Record that it does not work
-                self.outage_occurred = (
+                self.internet_outage_occurred = (
                     True  # Remember that the browser must be restarted afterwards
                 )
                 internet_just_went_down = True  # The outage callback has to be called
@@ -1764,16 +1917,18 @@ class InternetMonitor:  # Checks the internet in a background thread and tells t
                     "Could not handle the internet outage"
                 )  # Log the details
 
-    def confirm_internet_down(
+    def confirm_internet_is_down(
         self,
     ) -> bool:  # Check right now whether the internet is down
-        internet_works = check_internet_connection()  # Do a live check
-        self.update_internet_state(
-            internet_works
+        internet_is_working = check_internet_connection()  # Do a live check
+        self.update_internet_status(
+            internet_is_working
         )  # Update the shared state and handle the outage if needed
-        return not internet_works  # True when the internet is down
+        return not internet_is_working  # True when the internet is down
 
-    def raise_if_internet_down(self) -> None:  # Cheap check used before every request
+    def raise_error_if_internet_is_down(
+        self,
+    ) -> None:  # Cheap check used before every request
         if (
             not self.internet_available_event.is_set()
         ):  # The monitor says the internet is down
@@ -1781,21 +1936,21 @@ class InternetMonitor:  # Checks the internet in a background thread and tells t
                 "The internet is down"
             )  # Make the restart logic wait for it
 
-    def consume_outage_flag(
+    def read_and_clear_outage_flag(
         self,
     ) -> bool:  # Tell whether an outage happened since the last restart
-        with self.state_lock:  # Only one thread may change the state at a time
-            outage_flag_value, self.outage_occurred = (
-                self.outage_occurred,
+        with self.internet_state_lock:  # Only one thread may change the state at a time
+            outage_had_occurred, self.internet_outage_occurred = (
+                self.internet_outage_occurred,
                 False,
             )  # Read the flag and reset it
-            return outage_flag_value  # Give the old value back
+            return outage_had_occurred  # Give the old value back
 
     def wait_until_internet_available(self) -> None:  # Block until the internet works
         waited_seconds = 0  # Counts how long we have waited
         while not self.internet_available_event.wait(
             timeout=INTERNET_CHECK_INTERVAL_SECONDS
-        ):  # Wait for the "works" signal
+        ):  # Wait for the "internet works" signal
             waited_seconds += (
                 INTERNET_CHECK_INTERVAL_SECONDS  # Add the time we just waited
             )
@@ -1810,13 +1965,13 @@ class InternetMonitor:  # Checks the internet in a background thread and tells t
 
 # ============================================================== BROWSER SESSION
 
-BROWSER_CLOSED_MESSAGES = (
+ERROR_PHRASES_MEANING_BROWSER_IS_CLOSED = (
     "has been closed",
     "target closed",
     "browser closed",
     "connection closed",
     "browser has disconnected",
-)  # Known "browser is gone" phrases
+)  # Known phrases that mean "the browser is gone"
 
 
 def is_browser_closed_error(
@@ -1824,51 +1979,70 @@ def is_browser_closed_error(
 ) -> bool:  # Check whether an error means the browser is gone
     error_text = str(
         browser_error
-    ).lower()  # Lowercase the error text so the comparison ignores capitals
+    ).lower()  # Lowercase the error text so capitals do not matter
     return any(
-        closed_message in error_text for closed_message in BROWSER_CLOSED_MESSAGES
-    )  # True if any known phrase matches
+        closed_phrase in error_text
+        for closed_phrase in ERROR_PHRASES_MEANING_BROWSER_IS_CLOSED
+    )  # True if any known phrase appears
 
 
 class BrowserSession:  # Owns the browser and both tabs; can restart everything if the browser closes or crashes
-    """Owns the browser and both tabs; can restart everything if the browser closes or crashes."""  # Explanation
+    """Owns the browser and both tabs; can restart everything if the browser closes or crashes."""  # Short description
 
-    def __init__(self, internet_monitor: InternetMonitor):  # Setup
+    def __init__(self, internet_monitor: InternetMonitor):  # Set up an empty session
         self.internet_monitor = internet_monitor  # Tells us whether the internet works
         self.download_page: Optional[
             Page
         ] = None  # The temporary download tab, only set while it is open
-        self.is_opening_download_tab = (
+        self.is_download_tab_being_opened = (
             False  # True for a moment while we open the download tab ourselves
         )
         self.invisible_playwright_launcher: Optional[
             InvisiblePlaywright
-        ] = None  # The launcher, once started
-        self.connected_browser = None  # The Playwright Browser object
-        self.browser_context = None  # The browser context that owns both tabs
+        ] = None  # The browser launcher, once started
+        self.connected_browser: Any = None  # The Playwright Browser object
+        self.browser_context: Any = None  # The browser context that owns both tabs
         self.results_page: Optional[
             Page
-        ] = None  # Tab used for browsing the search results
-        self.restart_count = 0  # How many times the browser had to be restarted
+        ] = None  # The tab used for browsing the search results
+        self.browser_restart_count = 0  # How many times the browser had to be restarted
+
+    @property  # Lets the code write session.active_results_page without brackets
+    def active_results_page(
+        self,
+    ) -> Page:  # The results tab, or a clear error when no browser is running
+        if (
+            self.results_page is None
+        ):  # The browser was never started or has been stopped
+            raise RuntimeError(
+                "The browser is not running, so there is no results tab"
+            )  # Fail loudly instead of with a confusing None error
+        return self.results_page  # Hand back the open results tab
 
     def start_browser(self) -> None:  # Start the browser and open the results tab
         download_logger.info(
             "Starting the browser through invisible_playwright at %dx%d",
-            VIEWPORT_WIDTH_PIXELS,
-            VIEWPORT_HEIGHT_PIXELS,
+            BROWSER_WINDOW_WIDTH_PIXELS,
+            BROWSER_WINDOW_HEIGHT_PIXELS,
         )  # Record it
         self.invisible_playwright_launcher = InvisiblePlaywright(
             extra_prefs={"pdfjs.disabled": True}
-        )  # Without this Firefox shows PDFs in its viewer instead of downloading them
+        )  # Prepare the launcher; without this Firefox shows PDFs in its viewer instead of downloading them
         self.connected_browser = (
             self.invisible_playwright_launcher.__enter__()
         )  # Launch the browser
         self.browser_context = self.connected_browser.new_context(
-            viewport={"width": VIEWPORT_WIDTH_PIXELS, "height": VIEWPORT_HEIGHT_PIXELS},
-            screen={"width": VIEWPORT_WIDTH_PIXELS, "height": VIEWPORT_HEIGHT_PIXELS},
-        )  # The context both tabs live in, with a full HD window
+            viewport={
+                "width": BROWSER_WINDOW_WIDTH_PIXELS,
+                "height": BROWSER_WINDOW_HEIGHT_PIXELS,
+            },
+            screen={
+                "width": BROWSER_WINDOW_WIDTH_PIXELS,
+                "height": BROWSER_WINDOW_HEIGHT_PIXELS,
+            },
+        )  # Create the context both tabs live in, with a full HD window
         self.browser_context.set_default_timeout(
-            NAVIGATION_TIMEOUT_MS
+            PAGE_LOAD_TIMEOUT_MILLISECONDS
         )  # Default time limit for page actions in every tab
         self.results_page = self.browser_context.new_page()  # Open the first tab
         attach_browser_event_logging(
@@ -1878,13 +2052,13 @@ class BrowserSession:  # Owns the browser and both tabs; can restart everything 
             "page", self._close_unexpected_new_tab
         )  # Close any popup or extra tab the moment it opens
         self.results_page.bring_to_front()  # Show the results tab
-        mouse_position["x"], mouse_position["y"] = (
-            200.0,
-            200.0,
-        )  # A fresh browser starts with the pointer at a known place
+        reset_mouse_position()  # A fresh browser starts with the pointer at a known place
+        self.results_page.mouse.move(
+            current_mouse_x, current_mouse_y
+        )  # Tell the new tab where the pointer is, so the first human-like move does not start from a corner
 
-    @staticmethod  # Does not need access to the session
-    def _close_quietly(
+    @staticmethod  # This method does not need access to the session
+    def _close_tab_ignoring_errors(
         tab_to_close: Page,
     ) -> None:  # Close a tab, ignoring any error if it is already gone
         try:  # Closing can fail if the tab is already gone
@@ -1895,72 +2069,109 @@ class BrowserSession:  # Owns the browser and both tabs; can restart everything 
     def _close_unexpected_new_tab(
         self, new_tab: Page
     ) -> None:  # Close tabs that nobody asked for
-        if self.is_opening_download_tab or new_tab in (
+        if self.is_download_tab_being_opened or new_tab in (
             self.results_page,
             self.download_page,
-        ):  # A wanted tab
+        ):  # This is a tab we want
             return  # Leave it open
         download_logger.info(
             "Closing an unexpected new tab: %s", new_tab.url
         )  # Record which tab is closed
-        self._close_quietly(new_tab)  # Close it
+        self._close_tab_ignoring_errors(new_tab)  # Close it
+
+    def _list_all_browser_contexts(
+        self,
+    ) -> list:  # Find every browser context, so tabs in stray windows are found too
+        try:  # Asking the browser can fail if it is already gone
+            all_browser_contexts = list(
+                self.connected_browser.contexts
+            )  # Every context the browser currently has
+        except (
+            PlaywrightError,
+            AttributeError,
+        ):  # The browser is gone or was never started
+            all_browser_contexts = []  # We cannot see any contexts
+        if (
+            self.browser_context is not None
+            and self.browser_context not in all_browser_contexts
+        ):  # Our own context must always be included
+            all_browser_contexts.append(self.browser_context)  # Add it
+        return all_browser_contexts  # Give the list back
+
+    def _close_tabs_except(
+        self, tabs_to_keep: tuple
+    ) -> None:  # Close every tab and window that is not in the given list
+        for (
+            browser_context
+        ) in self._list_all_browser_contexts():  # Look at every context, not only ours
+            try:  # Reading the tab list can fail if the browser is gone
+                open_tabs = list(browser_context.pages)  # Every tab of this context
+            except PlaywrightError:  # The context is gone
+                continue  # Nothing to close here
+            for open_tab in open_tabs:  # Look at every open tab
+                if open_tab not in tabs_to_keep:  # A tab we do not need
+                    download_logger.info(
+                        "Closing an unneeded tab: %s", open_tab.url
+                    )  # Record which tab is closed
+                    self._close_tab_ignoring_errors(
+                        open_tab
+                    )  # Close it; closing a window's last tab closes the window
 
     def close_unneeded_tabs(
         self,
-    ) -> None:  # Close every tab except the results tab and the download tab
-        for open_tab in list(self.browser_context.pages):  # Look at every open tab
-            if open_tab not in (
-                self.results_page,
-                self.download_page,
-            ):  # A tab we do not need
-                download_logger.info(
-                    "Closing an unneeded tab: %s", open_tab.url
-                )  # Record which tab is closed
-                self._close_quietly(open_tab)  # Close it
+    ) -> None:  # Keep only the results tab (and the download tab while it is in use)
+        self._close_tabs_except(
+            (self.results_page, self.download_page)
+        )  # Close everything else
+
+    def close_all_tabs(
+        self,
+    ) -> None:  # Close every tab and window, used when the work is finished
+        self._close_tabs_except(())  # Keep nothing open
 
     def handle_internet_outage(
         self,
     ) -> None:  # Called by the monitor thread when the internet goes down
         # Playwright's sync API must only be used from the thread that started it, so this thread
-        # cannot close the browser. The main thread sees the outage at its next step
-        # (raise_if_internet_down) and restart_browser() closes the old browser.
+        # cannot close the browser. The main thread notices the outage at its next step
+        # (raise_error_if_internet_is_down) and restart_browser() closes the old browser.
         download_logger.error(
             "The internet is down: the browser will be closed and restarted by the main thread"
         )  # Record it
 
-    @contextmanager  # Turns the method below into something that can be used in a "with" block
+    @contextmanager  # Turns the method below into something usable in a "with" block
     def temporary_download_tab(
         self,
     ) -> Iterator[Page]:  # Open a second tab only while downloads need it
         download_logger.info(
             "Opening a temporary second tab for downloading"
         )  # Record it
-        self.is_opening_download_tab = (
-            True  # Tell the popup guard that this new tab is wanted
+        self.is_download_tab_being_opened = (
+            True  # Tell the popup guard that the next new tab is wanted
         )
         try:  # Make sure the flag is always reset
             try:  # Opening the tab through the page can be blocked as a popup
                 with self.browser_context.expect_page(
-                    timeout=NAVIGATION_TIMEOUT_MS
-                ) as new_tab_information:  # Wait for the new tab to appear
-                    self.results_page.evaluate(
+                    timeout=PAGE_LOAD_TIMEOUT_MILLISECONDS
+                ) as new_tab_event_info:  # Wait for the new tab to appear
+                    self.active_results_page.evaluate(
                         "() => { window.open('about:blank', '_blank'); }"
-                    )  # Firefox opens this as a tab in the same window
-                new_download_page = new_tab_information.value  # The second tab
-            except PlaywrightTimeoutError:  # No tab appeared, probably blocked as a popup
+                    )  # Ask Firefox to open a blank tab in the same window
+                new_download_page = new_tab_event_info.value  # The second tab
+            except PlaywrightTimeoutError:  # No tab appeared, probably because it was blocked as a popup
                 download_logger.warning(
                     "The tab did not open from the page, opening it directly instead"
                 )  # Record the fallback
                 new_download_page = (
                     self.browser_context.new_page()
                 )  # Open the tab directly
-            self.results_page.bring_to_front()  # Keep showing the results tab, downloads work from the background tab
+            self.active_results_page.bring_to_front()  # Keep showing the results tab; downloads work from a background tab
         finally:  # Always runs
-            self.is_opening_download_tab = (
+            self.is_download_tab_being_opened = (
                 False  # The popup guard may close unexpected tabs again
             )
 
-        self.download_page = new_download_page  # Remember it so the guards leave it alone while it is open
+        self.download_page = new_download_page  # Remember the tab so the guards leave it alone while it is open
         attach_browser_event_logging(
             new_download_page
         )  # Start logging everything the download tab does
@@ -1969,16 +2180,25 @@ class BrowserSession:  # Owns the browser and both tabs; can restart everything 
         finally:  # Always runs, even after an error
             self.download_page = None  # The download tab is going away
             download_logger.info("Closing the temporary download tab")  # Record it
-            try:  # Closing can fail if the browser itself is gone
-                new_download_page.close()  # Close the second tab
-                self.results_page.bring_to_front()  # Show the results tab again
+            self._close_tab_ignoring_errors(
+                new_download_page
+            )  # Close the second tab as soon as the downloads are done
+            try:  # The remaining steps can fail if the browser itself is gone
+                self.close_unneeded_tabs()  # Make sure nothing but the results tab is left open
+                self.active_results_page.bring_to_front()  # Show the results tab again
             except PlaywrightError:  # The tab or browser was already gone
                 pass  # Nothing more to do
 
     def stop_browser(self) -> None:  # Close the browser
         if (
             self.invisible_playwright_launcher is not None
-        ):  # Check whether a browser was started
+        ):  # Check whether a browser was ever started
+            try:  # Closing tabs can fail if the browser is already gone
+                self.close_all_tabs()  # Close every tab and window first, so nothing is left behind
+                if self.browser_context is not None:  # Our context still exists
+                    self.browser_context.close()  # Close the context itself
+            except PlaywrightError:  # The browser was already gone
+                pass  # Nothing more to close
             try:  # The browser may already be dead
                 self.invisible_playwright_launcher.__exit__(
                     None, None, None
@@ -1990,48 +2210,48 @@ class BrowserSession:  # Owns the browser and both tabs; can restart everything 
         self.invisible_playwright_launcher = None  # Forget the old launcher
         self.connected_browser = None  # Forget the old browser
         self.browser_context = None  # Forget the old context
-        self.results_page = None  # Forget the old tab
+        self.results_page = None  # Forget the old results tab
         self.download_page = None  # Forget the old download tab
 
     def restart_browser(
         self,
     ) -> None:  # Start a fresh browser after the old one closed or crashed
         if (
-            self.internet_monitor.consume_outage_flag()
+            self.internet_monitor.read_and_clear_outage_flag()
         ):  # Check whether this restart is only because the internet was down
             download_logger.info(
                 "This restart is due to an internet outage, so it does not count towards the limit"
             )  # Say so
         else:  # The restart has another reason, such as a crash
-            self.restart_count += 1  # Count this restart
+            self.browser_restart_count += 1  # Count this restart
             if (
-                self.restart_count > MAX_BROWSER_RESTARTS
+                self.browser_restart_count > MAXIMUM_BROWSER_RESTARTS
             ):  # Check whether we have restarted too often
                 raise RuntimeError(
-                    f"The browser closed more than {MAX_BROWSER_RESTARTS} times, giving up"
+                    f"The browser closed more than {MAXIMUM_BROWSER_RESTARTS} times, giving up"
                 )  # Stop the run
         download_logger.error(
             "Browser problem detected. Restarting (%d/%d)",
-            self.restart_count,
-            MAX_BROWSER_RESTARTS,
+            self.browser_restart_count,
+            MAXIMUM_BROWSER_RESTARTS,
         )  # Record it
         self.stop_browser()  # Close whatever is left of the old browser
         self.internet_monitor.wait_until_internet_available()  # Do not start the browser until the internet works
         time.sleep(3)  # Give the system a moment to free resources
         self.start_browser()  # Start a fresh browser with a new results tab
         warm_up_session_on_home_page(
-            self.results_page
+            self.active_results_page
         )  # Visit the home page again to refresh the session
+        self.close_unneeded_tabs()  # Leave only the results tab open after the warm-up
 
 
-def run_with_browser_restarts(
-    browser_session: BrowserSession, step_description: str, step_function
-) -> None:  # Run a step, restarting the browser if needed
-    """Run a step, transparently restarting the browser (and retrying) on a crash or internet outage."""  # Explanation
+def run_step_and_restart_browser_if_needed(
+    browser_session: BrowserSession, step_description: str, step_to_run
+):  # Run a step, restarting the browser if needed, and return its result
+    """Run a step, transparently restarting the browser and retrying after a crash or internet outage."""  # Short description
     while True:  # Keep trying until the step finishes or we give up
         try:  # The step may fail if the browser closes
-            step_function()  # Run the step
-            return  # The step finished, so we are done
+            return step_to_run()  # Run the step and hand back whatever it returns
         except InternetOutageError as outage_error:  # The internet went down
             download_logger.warning(
                 "Internet outage during %s: %s", step_description, outage_error
@@ -2045,11 +2265,11 @@ def run_with_browser_restarts(
                     "Browser closed during %s: %s",
                     step_description,
                     str(browser_error).splitlines()[0],
-                )  # Log it
-                browser_session.restart_browser()  # Start a new browser, which raises an error if restarts ran out
+                )  # Record it
+                browser_session.restart_browser()  # Start a new browser, which raises an error if the restarts ran out
             elif (
-                browser_session.internet_monitor.confirm_internet_down()
-            ):  # Check whether the internet being down is the cause
+                browser_session.internet_monitor.confirm_internet_is_down()
+            ):  # Check whether a lost internet connection is the cause
                 download_logger.warning(
                     "The internet is down, so the error during %s is expected",
                     step_description,
@@ -2058,15 +2278,46 @@ def run_with_browser_restarts(
             else:  # Some other, real browser error
                 download_logger.exception(
                     "Browser error during %s, skipping this step", step_description
-                )  # Log the full error
-                return  # Go on with the next step instead of crashing the whole run
+                )  # Record the full error
+                return (
+                    None  # Go on with the next step instead of crashing the whole run
+                )
 
 
 # ============================================================== MAIN PROGRAM
 
 
-def run_downloader() -> None:  # Run the whole job from start to finish
+def search_keywords_and_return_failed_ones(
+    browser_session: BrowserSession,
+    download_database: DownloadDatabase,
+    keywords_to_search: list,
+    run_statistics: RunStatistics,
+) -> list:  # Search a list of keywords and return the ones that failed
+    failed_keywords = []  # Keywords that could not be searched this time
+    for keyword_position, search_keyword in enumerate(
+        keywords_to_search, start=1
+    ):  # Go through the keywords one by one
+        if keyword_position > 1:  # Only pause between two keywords
+            pause_while_acting_like_a_human(
+                browser_session.active_results_page,
+                *PAUSE_SECONDS_RANGE_BETWEEN_KEYWORDS,
+                "before the next keyword",
+            )  # Move the mouse and scroll instead of sitting still
+        keyword_was_searched = run_step_and_restart_browser_if_needed(  # Search the keyword, restarting the browser if it closes
+            browser_session,  # The session that owns the browser
+            f"keyword '{search_keyword}'",  # Description used in log messages
+            lambda keyword_to_search=search_keyword: search_one_keyword_and_download_pdfs(
+                browser_session, download_database, keyword_to_search, run_statistics
+            ),  # The work to do for this keyword
+        )  # End of the restart wrapper
+        if keyword_was_searched is not True:  # The keyword was skipped or hit an error
+            failed_keywords.append(search_keyword)  # Remember it for a second try
+    return failed_keywords  # Give back the keywords that still need work
+
+
+def run_sds_downloader() -> None:  # Run the whole job from start to finish
     configure_console_logging()  # Turn on console logging first so everything is shown
+    validate_settings()  # Stop early if a setting is obviously wrong
     download_logger.info(
         "Download folder: %s", DOWNLOAD_FOLDER
     )  # Record where PDFs are saved
@@ -2075,19 +2326,13 @@ def run_downloader() -> None:  # Run the whole job from start to finish
     )  # Record which keywords will be searched
 
     DOWNLOAD_FOLDER.mkdir(exist_ok=True)  # Make sure the PDFs folder exists
-    database = DownloadDatabase(DATABASE_FILE_PATH)  # Open the SQLite database
-    database.register_existing_pdf_files(
+    download_database = DownloadDatabase(DATABASE_FILE_PATH)  # Open the SQLite database
+    download_database.register_pdf_files_already_on_disk(
         DOWNLOAD_FOLDER
     )  # Remember PDFs that are already in the folder
-    database.ignore_non_usa_english_urls()  # Skip old pending URLs that are not USA English
+    download_database.ignore_urls_that_are_not_usa_english()  # Skip old pending URLs that are not USA English
 
-    run_statistics = {
-        "downloaded": 0,
-        "skipped": 0,
-        "unavailable": 0,
-        "failed": 0,
-        "consecutive_blocks": 0,
-    }  # Running totals for the whole run
+    run_statistics = RunStatistics()  # Running totals for the whole run
 
     try:  # Make sure the database is closed even if something fails
         internet_monitor = InternetMonitor()  # Prepare the background internet check
@@ -2099,59 +2344,68 @@ def run_downloader() -> None:  # Run the whole job from start to finish
             internet_monitor.wait_until_internet_available()  # Do not start the browser while the internet is down
             browser_session.start_browser()  # Start the browser with a single results tab
             if not warm_up_session_on_home_page(
-                browser_session.results_page
+                browser_session.active_results_page
             ):  # Visit the home page and browse around first
                 download_logger.warning(
                     "Warm-up did not finish cleanly, continuing anyway"
                 )  # Record the problem
+            browser_session.close_unneeded_tabs()  # Leave only the results tab open after the warm-up
 
-            for keyword_position, search_keyword in enumerate(
-                SEARCH_KEYWORDS, start=1
-            ):  # Go through a-z and 0-9
-                if keyword_position > 1:  # Only pause between two keywords
-                    pause_while_acting_like_a_person(
-                        browser_session.results_page,
-                        *PAUSE_BETWEEN_KEYWORDS,
-                        "before the next keyword",
-                    )  # Move the mouse, scroll and press random letters instead of sitting still
-                run_with_browser_restarts(  # Run the keyword, restarting the browser if it closes
-                    browser_session,  # The session that owns the browser
-                    f"keyword '{search_keyword}'",  # Description used in log messages
-                    lambda current_keyword=search_keyword: collect_and_download_pdf_urls_for_keyword(
-                        browser_session, database, current_keyword, run_statistics
-                    ),  # The work to do for this keyword
-                )  # End of the restart wrapper
+            failed_keywords = search_keywords_and_return_failed_ones(
+                browser_session, download_database, SEARCH_KEYWORDS, run_statistics
+            )  # Search every keyword once
+            if failed_keywords:  # Some keywords could not be searched
+                download_logger.info(
+                    "Retrying %d keyword(s) that failed: %s",
+                    len(failed_keywords),
+                    " ".join(failed_keywords),
+                )  # Say which ones
+                still_failed_keywords = search_keywords_and_return_failed_ones(
+                    browser_session, download_database, failed_keywords, run_statistics
+                )  # Give them a second chance
+                if still_failed_keywords:  # Some keywords failed twice
+                    download_logger.warning(
+                        "Keywords that still failed: %s",
+                        " ".join(still_failed_keywords),
+                    )  # Report them
 
             download_logger.info(
                 "Retrying URLs that are still pending"
-            )  # Record the retry
-            run_with_browser_restarts(  # Retry pending URLs, restarting the browser if it closes
+            )  # Record the final retry
+            run_step_and_restart_browser_if_needed(  # Retry pending URLs, restarting the browser if it closes
                 browser_session,  # The session that owns the browser
                 "the retry of pending URLs",  # Description used in log messages
-                lambda: download_pdf_urls_in_temporary_tab(
+                lambda: download_pdf_files_using_temporary_tab(
                     browser_session,
-                    database,
-                    database.load_unprocessed_urls(),
+                    download_database,
+                    download_database.load_unprocessed_urls(),
                     run_statistics,
-                ),  # Re-reads the pending URLs on each attempt
+                ),  # Re-reads the pending URLs on every attempt
             )  # End of the restart wrapper
         finally:  # Always runs, even after an error
             internet_monitor.stop_monitoring()  # Stop the background internet check
+            browser_session.close_all_tabs()  # The work is finished, so close every tab and window
             browser_session.stop_browser()  # Close the browser
     except AccessBlockedError as blocked_error:  # The website blocked us too many times in a row
         download_logger.error(
             "STOPPED EARLY: %s", blocked_error
         )  # Explain why the run ended
+    except KeyboardInterrupt:  # The user pressed Ctrl+C
+        download_logger.warning(
+            "Stopped by the user; progress is saved and the next run continues from here"
+        )  # Explain what happens
     except Exception:  # Anything unexpected that escaped the code above
         download_logger.exception(
             "Unexpected error, stopping"
-        )  # Log the full error with its traceback
+        )  # Record the full error with its traceback
         raise  # Pass the error on so the script exits with an error code
     finally:  # Always runs at the very end
         log_run_statistics(run_statistics, "FINAL")  # Show the final totals
-        database.close_database()  # Close the database
+        download_database.close_database()  # Close the database
         download_logger.info("Database closed, finished")  # Record the final step
 
 
-if __name__ == "__main__":  # Only run when this file is executed directly
-    run_downloader()  # Start the job
+if (
+    __name__ == "__main__"
+):  # Only run when this file is executed directly, not when it is imported
+    run_sds_downloader()  # Start the job
