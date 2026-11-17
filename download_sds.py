@@ -10,6 +10,7 @@
 # The browser is controlled through invisible_playwright (Playwright on an anti-detect Firefox).
 #
 # How the script works:
+#   * Before anything is requested, the download folder is checked: a document that already has a file there is skipped.
 #   * It starts one browser window at 1920x1080 with a single "results" tab.
 #   * It visits the home page and a few other pages first, behaving like an ordinary visitor.
 #   * It then searches the keywords a-z and 0-9, one after another.
@@ -353,6 +354,11 @@ class DownloadDatabase:  # Wraps the SQLite connection and every query this scri
         self.database_connection = sqlite3.connect(
             database_path
         )  # Connect to the database file on disk
+        self.safe_file_names_found_in_folder: set[
+            str
+        ] = (
+            set()
+        )  # Clean names of the PDFs seen in the download folder, so files are recognised even when their names use capitals or spaces
         with self.database_connection:  # Save the changes automatically when this block ends
             self.database_connection.execute(
                 "CREATE TABLE IF NOT EXISTS collected_urls (source_url TEXT PRIMARY KEY, is_processed INTEGER NOT NULL DEFAULT 0)"
@@ -366,26 +372,32 @@ class DownloadDatabase:  # Wraps the SQLite connection and every query this scri
 
     def register_pdf_files_already_on_disk(
         self, pdf_folder: Path
-    ) -> None:  # Remember PDFs that are already on disk
-        """Record PDFs already on disk so they are never downloaded again."""  # Short description
+    ) -> None:  # Look at the download folder first and remember every PDF in it
+        """Scan the download folder so every PDF that is already there is skipped and never downloaded again."""  # Short description
         newly_registered_count = (
-            0  # Counts how many existing files were newly registered
+            0  # Counts how many existing files were newly registered in the database
         )
         with self.database_connection:  # Save the changes automatically when this block ends
-            for pdf_path in pdf_folder.glob(
-                "*.pdf"
-            ):  # Look at every PDF already in the folder
+            for pdf_path in pdf_folder.iterdir():  # Look at every file in the folder
+                if (
+                    not pdf_path.is_file() or pdf_path.suffix.lower() != ".pdf"
+                ):  # Ignore sub-folders and files that are not PDFs (.PDF counts too)
+                    continue  # Move on to the next file
+                self.safe_file_names_found_in_folder.add(
+                    build_safe_file_name(pdf_path.name)
+                )  # Remember its clean name, so "Foo Bar_NAEnglish.PDF" matches "foo_bar_naenglish.pdf"
                 insert_result = self.database_connection.execute(
                     "INSERT OR IGNORE INTO downloaded_files (file_name, source_url) VALUES (?, ?)",
                     (pdf_path.name, "found on disk before first run"),
-                )  # Insert the file name unless it is already recorded
+                )  # Also record it in the database
                 newly_registered_count += (
                     insert_result.rowcount
                 )  # Add one when a new row was really inserted
         download_logger.info(
-            "Registered %d existing PDF file(s) from %s",
-            newly_registered_count,
+            "Download folder check: %d PDF file(s) found in %s (%d newly recorded); documents that already have a file are skipped",
+            len(self.safe_file_names_found_in_folder),
             pdf_folder,
+            newly_registered_count,
         )  # Report the result
 
     def ignore_urls_in_unwanted_formats(
@@ -463,9 +475,15 @@ class DownloadDatabase:  # Wraps the SQLite connection and every query this scri
     def is_file_name_already_saved(
         self, file_name: str
     ) -> bool:  # Check whether a file name was already saved
+        """The download folder is checked first because the files on disk are the truth; the database is only a backup record."""  # Short description
+        if (
+            file_name in self.safe_file_names_found_in_folder
+            or (DOWNLOAD_FOLDER / file_name).exists()
+        ):  # The file is in the download folder
+            return True  # Nothing more to check
         matching_row = self.database_connection.execute(
             "SELECT 1 FROM downloaded_files WHERE file_name = ?", (file_name,)
-        ).fetchone()  # Look the name up
+        ).fetchone()  # Otherwise look the name up in the database
         return matching_row is not None  # True when a matching row exists
 
     def record_saved_file(
@@ -476,6 +494,9 @@ class DownloadDatabase:  # Wraps the SQLite connection and every query this scri
                 "INSERT OR IGNORE INTO downloaded_files (file_name, source_url) VALUES (?, ?)",
                 (file_name, source_url),
             )  # Insert a row describing the saved file
+        self.safe_file_names_found_in_folder.add(
+            file_name
+        )  # The file is now in the download folder as well
 
     def is_file_for_url_already_downloaded(
         self, source_url: str
@@ -489,10 +510,9 @@ class DownloadDatabase:  # Wraps the SQLite connection and every query this scri
         safe_file_name = build_safe_file_name(
             guessed_file_name
         )  # Apply the naming rules to the guess
-        return (
-            self.is_file_name_already_saved(safe_file_name)
-            or (DOWNLOAD_FOLDER / safe_file_name).exists()
-        )  # Known in the database or already on disk
+        return self.is_file_name_already_saved(
+            safe_file_name
+        )  # Checks the download folder first, then the database
 
     def is_any_version_of_document_saved(
         self, document_key: str
@@ -504,10 +524,9 @@ class DownloadDatabase:  # Wraps the SQLite connection and every query this scri
             possible_file_name = build_safe_file_name(
                 document_key + version_suffix
             )  # The name this version would be saved under
-            if (
-                self.is_file_name_already_saved(possible_file_name)
-                or (DOWNLOAD_FOLDER / possible_file_name).exists()
-            ):  # Known in the database or already on disk
+            if self.is_file_name_already_saved(
+                possible_file_name
+            ):  # Found in the download folder or, failing that, in the database
                 return True  # One version is enough
         return False  # No version of this document has been saved yet
 
@@ -1529,6 +1548,30 @@ def mark_versions_as_skipped(
         run_statistics.skipped_count += 1  # Count the skip
 
 
+def skip_documents_already_in_download_folder(
+    download_database: DownloadDatabase, found_urls: set, run_statistics: RunStatistics
+) -> set:  # Drop every document that already has a file, before anything is requested
+    """Check the download folder first: documents that already have a file are marked as finished and never requested."""  # Short description
+    urls_still_needed: set[
+        str
+    ] = set()  # Collects the addresses of documents that have no file yet
+    for document_key, version_urls in group_urls_by_document(
+        found_urls
+    ).items():  # Look at one document at a time
+        if download_database.is_any_version_of_document_saved(
+            document_key
+        ):  # The download folder (or the database) already has a file for it
+            mark_versions_as_skipped(
+                download_database,
+                version_urls,
+                run_statistics,
+                "this document already has a file in the download folder",
+            )  # Skip every version of it
+        else:  # No file yet
+            urls_still_needed.update(version_urls)  # Keep it for the download steps
+    return urls_still_needed  # Give back only what still needs work
+
+
 def download_single_url(
     download_page: Page,
     download_database: DownloadDatabase,
@@ -1755,10 +1798,9 @@ def check_and_save_finished_download(
     safe_file_path = (
         DOWNLOAD_FOLDER / safe_file_name
     )  # Full path where the PDF will be saved
-    if (
-        download_database.is_file_name_already_saved(safe_file_name)
-        or safe_file_path.exists()
-    ):  # Check whether this file name is already saved
+    if download_database.is_file_name_already_saved(
+        safe_file_name
+    ):  # Check whether this file name is already in the download folder or the database
         download_logger.info(
             "  DUPLICATE file name, not saved: %s", safe_file_name
         )  # Explain what happens
@@ -1950,9 +1992,12 @@ def search_one_keyword_and_download_pdfs(
             download_database.save_newly_found_urls(
                 new_urls
             )  # Store the new addresses in the database
+            urls_without_files = skip_documents_already_in_download_folder(
+                download_database, new_urls, run_statistics
+            )  # Check the download folder first and skip documents that already have a file
             default_version_documents = select_documents_with_default_version(
-                download_database, new_urls
-            )  # Documents whose default version is on this page
+                download_database, urls_without_files
+            )  # Documents whose default version is on this page and that have no file yet
             download_logger.info(
                 "[%s] page %d: downloading %d default version(s) right away; fallback versions wait until every keyword is searched",
                 search_keyword,
