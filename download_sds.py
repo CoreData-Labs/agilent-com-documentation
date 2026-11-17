@@ -73,8 +73,8 @@ OTHER_PAGES_TO_VISIT = 3  # How many other pages are opened from the home page
 OTHER_PAGE_BROWSING_SECONDS = 30  # How long to stay on each of those pages
 REQUIRED_USA_ENGLISH_FILE_NAME_ENDING = "_NAEnglish.pdf"  # Only files whose name ends like this (USA English) are downloaded
 
-BROWSER_WINDOW_WIDTH_PIXELS = 1920  # Browser window width in pixels (full HD)
-BROWSER_WINDOW_HEIGHT_PIXELS = 1080  # Browser window height in pixels (full HD)
+BROWSER_WINDOW_WIDTH_PIXELS = 2400  # Browser window width in pixels (full HD)
+BROWSER_WINDOW_HEIGHT_PIXELS = 1350  # Browser window height in pixels (full HD)
 
 DOWNLOAD_FOLDER = Path("PDFs").resolve()  # Full path of the folder where PDFs are saved
 DATABASE_FILE_PATH = Path(
