@@ -8,9 +8,12 @@
 #   3. If neither is available, one of _Australia.pdf, _EUEnglish.pdf, _MalayEnglish.pdf or _UKEnglish.pdf is used.
 #   4. If none of these versions exists, the document is skipped. Any other file format is ignored.
 #
-# JOB 2 (runs after job 1 has finished): Walks through the result pages of
-# https://www.agilent.com/en/search/safety-data-sheets and downloads every card that is labelled
-# "English - United States". It downloads those on the current page, goes to the next page, and repeats.
+# JOB 2 (runs after job 1 has finished): downloads every "English - United States" document from
+# https://www.agilent.com/en/search/safety-data-sheets
+#   * Every result page is opened directly by its address (c_ds_firstResult=0, 10, 20, ...).
+#   * The site only lets you reach 5,000 results (500 pages), so the query asks for US English documents only
+#     and, if that is still more than 5,000, the publication-date range is split in halves until every piece fits.
+#   * Progress is saved in the database, so a stopped run continues at the page where it stopped.
 #
 # The browser is controlled through invisible_playwright (Playwright on an anti-detect Firefox).
 #
@@ -24,7 +27,7 @@
 #   * After each page of results it downloads the PDFs found there, using a short-lived second tab
 #     that is opened only when something needs downloading and closed right afterwards.
 #   * Only the results tab is ever kept open; popups, extra tabs and extra windows are closed at once.
-#   * A SQLite database remembers every URL and file name, so nothing is downloaded twice.
+#   * A SQLite database remembers every URL, file name and job 2 page position, so nothing is downloaded twice.
 #   * If the browser crashes, or the internet drops, the browser is restarted and the work continues.
 #   * Random pauses, back-off waits and a "stop after too many blocks" rule keep the traffic gentle.
 #   * Keywords that could not be searched are retried once at the end.
@@ -50,13 +53,21 @@ from contextlib import (
     contextmanager,
 )  # Turns a method into something usable in a "with" block
 from dataclasses import dataclass  # Makes small classes that only hold data
+from datetime import (
+    date,
+    timedelta,
+)  # Calendar dates for splitting the publication-date range
 from pathlib import Path  # Object-oriented filesystem paths
 from typing import (
     Any,
     Iterator,
     Optional,
 )  # Type hints for generators, optional values and Playwright objects
-from urllib.parse import unquote, urlparse  # Helpers to read a file name out of a URL
+from urllib.parse import (
+    unquote,
+    urlencode,
+    urlparse,
+)  # Helpers to read a file name out of a URL and to build addresses
 
 from invisible_playwright import (
     InvisiblePlaywright,
@@ -102,27 +113,30 @@ ALLOWED_VERSION_SUFFIXES_BEST_FIRST = (
 ) + OTHER_VERSION_SUFFIXES  # Every format that may be downloaded, best first; all other formats are ignored
 
 # ---- Job 2: the "Safety Data Sheets (SDS)" search page
-SDS_PAGE_PLAIN_URL = "https://www.agilent.com/en/search/safety-data-sheets"  # The page with every safety data sheet
-SDS_PAGE_FILTERED_URL = (
-    "https://www.agilent.com/en/search/safety-data-sheets"
-    "?cq=%40objecttype%3D%3D%22Material%20Safety%20Data%20Sheet%22"
-    "%20AND%20%40locale%3D%3D%22English_UNITED%20STATES%22"
-)  # Same page, but asking the search engine for US English documents only (tried first)
-TRY_FILTERED_SDS_URL_FIRST = (
-    True  # If the filtered address shows no results, the plain address is used instead
+SDS_BASE_URL = "https://www.agilent.com/en/search/safety-data-sheets"  # The page with every safety data sheet
+SDS_OBJECT_TYPE_CLAUSE = '@objecttype=="Material Safety Data Sheet"'  # Part of the query that selects safety data sheets (same as in the address you gave me)
+SDS_LOCALE_CLAUSE = '@locale=="English_UNITED STATES"'  # Extra query part that asks the search engine for US English documents only
+SDS_DATE_FIELD = (
+    "publicationdate"  # The search field used to cut the results into date ranges
 )
+SDS_LANGUAGE_FACET_PARAMETER = (
+    "c_ds_f-agilent_doc_language_long"  # The address parameter of the "Language" filter
+)
+SDS_LANGUAGE_FACET_VALUE = "English"  # The language filter value
+SDS_FIRST_RESULT_PARAMETER = (
+    "c_ds_firstResult"  # The address parameter that selects the page (0, 10, 20, ...)
+)
+USE_LOCALE_CLAUSE = True  # Try the US English query first; if it does not work, fall back to the plain English filter
 US_ENGLISH_LABEL = (
     "English - United States"  # Only cards carrying this language tag are downloaded
 )
+SDS_RESULTS_PER_PAGE = 10  # The site shows 10 cards per page
+SDS_MAXIMUM_REACHABLE_RESULTS = 5000  # The site shows at most 500 pages, so only the first 5,000 results of a query can be reached
 SDS_RESULTS_SCOPE_SELECTOR = "[data-tab-content='documentsSupport']"  # The results tab that holds the safety data sheet cards
-SDS_NEXT_BUTTON_SELECTOR = (
-    SDS_RESULTS_SCOPE_SELECTOR + " agt-pagination button[data-action='next']"
-)  # The "next page" button of that tab
-MAXIMUM_SDS_RESULT_PAGES = (
-    600  # Safety limit; the site shows at most 500 pages of 10 results
-)
-SDS_PAGE_CHANGE_TIMEOUT_SECONDS = (
-    20  # How long to wait for new cards to appear after clicking "next"
+SDS_EARLIEST_DATE = date(1990, 1, 1)  # The date range that is split starts here
+SDS_LATEST_DATE = date(2027, 12, 31)  # The date range that is split ends here
+SDS_WAIT_FOR_RESULTS_SECONDS = (
+    25  # How long to wait for a result page to show its cards or its total
 )
 
 BROWSER_WINDOW_WIDTH_PIXELS = 1920  # Browser window width in pixels (full HD)
@@ -220,6 +234,12 @@ def validate_settings() -> None:  # Stop immediately if a setting above is obvio
         assert (
             0 <= pause_range[0] <= pause_range[1]
         ), f"Pause range {pause_range} must be (low, high) with low <= high"  # The low value must not exceed the high value
+    assert (
+        SDS_EARLIEST_DATE < SDS_LATEST_DATE
+    ), "SDS_EARLIEST_DATE must be before SDS_LATEST_DATE"  # The date range must make sense
+    assert (
+        SDS_MAXIMUM_REACHABLE_RESULTS % SDS_RESULTS_PER_PAGE == 0
+    ), "The reachable result count must be a whole number of pages"  # Pages are whole
 
 
 class AccessBlockedError(
@@ -370,9 +390,10 @@ def remove_fragment_from_url(
 
 # ============================================================== DATABASE
 #
-# Two tables:
+# Three tables:
 #   collected_urls   -- every PDF URL ever seen, and whether it has been handled
 #   downloaded_files -- every file name actually saved, so duplicate names are caught too
+#   sds_segments     -- job 2: every query piece (date range), its result count and the page it has reached
 
 
 class DownloadDatabase:  # Wraps the SQLite connection and every query this script needs
@@ -395,9 +416,42 @@ class DownloadDatabase:  # Wraps the SQLite connection and every query this scri
             self.database_connection.execute(
                 "CREATE TABLE IF NOT EXISTS downloaded_files (file_name TEXT PRIMARY KEY COLLATE NOCASE, source_url TEXT NOT NULL, downloaded_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)"
             )  # One row per saved file name
+            self.database_connection.execute(
+                "CREATE TABLE IF NOT EXISTS sds_segments (segment_key TEXT PRIMARY KEY, total_results INTEGER NOT NULL, next_first_result INTEGER NOT NULL DEFAULT 0, is_finished INTEGER NOT NULL DEFAULT 0)"
+            )  # One row per query piece of job 2, so a stopped run can continue where it stopped
 
     def close_database(self) -> None:  # Close the database connection
         self.database_connection.close()  # Release the database file
+
+    def load_sds_segment(
+        self, segment_key: str
+    ) -> Optional[
+        tuple
+    ]:  # Read the saved state of one query piece: (total, next first result, finished)
+        database_row = self.database_connection.execute(
+            "SELECT total_results, next_first_result, is_finished FROM sds_segments WHERE segment_key = ?",
+            (segment_key,),
+        ).fetchone()  # Look the piece up
+        if database_row is None:  # Never seen before
+            return None  # Nothing saved
+        return (
+            int(database_row[0]),
+            int(database_row[1]),
+            bool(database_row[2]),
+        )  # Give back the saved state
+
+    def save_sds_segment(
+        self,
+        segment_key: str,
+        total_results: int,
+        next_first_result: int,
+        is_finished: bool,
+    ) -> None:  # Save the state of one query piece
+        with self.database_connection:  # Save the change automatically when this block ends
+            self.database_connection.execute(
+                "INSERT OR REPLACE INTO sds_segments (segment_key, total_results, next_first_result, is_finished) VALUES (?, ?, ?, ?)",
+                (segment_key, total_results, next_first_result, int(is_finished)),
+            )  # Insert or update the row
 
     def register_pdf_files_already_on_disk(
         self, pdf_folder: Path
@@ -2077,8 +2131,16 @@ def search_one_keyword_and_download_pdfs(
 #
 # The page https://www.agilent.com/en/search/safety-data-sheets shows 10 cards per page. Every card has
 #   <a class="pub-ext" href="/library/msds/....pdf">  and a tag line such as  <span class="meta-text">English - United States</span>
-# Only the cards tagged "English - United States" are downloaded. Then the "next" button of the
-# pagination bar is clicked, and the same is repeated on the following page.
+#
+# Result pages are opened directly by address:
+#   ...?cq=<query>&searchAttempt=modified&c_ds_f-agilent_doc_language_long=English&c_ds_firstResult=10   (page 2)
+#
+# The site never shows more than 5,000 results (500 pages) for one query. So the query is cut into "segments":
+#   * The first segment is every US English document.
+#   * If a segment has more than 5,000 results, its publication-date range is split in two halves,
+#     and each half is a new segment, until every segment fits.
+# The state of every segment (total, page reached, finished) is stored in the database, so a stopped run
+# continues exactly where it stopped and finished segments are never requested again.
 
 READ_SDS_CARDS_SCRIPT = (  # JavaScript that describes every card in the safety data sheet results tab
     "(scopeSelector) => {"  # The argument is the CSS selector of the results tab
@@ -2089,6 +2151,23 @@ READ_SDS_CARDS_SCRIPT = (  # JavaScript that describes every card in the safety 
     "const labels = Array.from(card.querySelectorAll('.meta-text')).map(tag => tag.innerText.trim());"  # The tags: date, file type, language
     "return {href: link ? link.href : null, labels: labels};"  # Give back the address and the tags
     "});"  # End of the loop over cards
+    "}"  # End of the function
+)  # End of the script
+READ_SDS_TOTAL_SCRIPT = (  # JavaScript that reads the total number of results of the current query
+    "(scopeSelector) => {"  # The argument is the CSS selector of the results tab
+    "const scope = document.querySelector(scopeSelector);"  # Find the results tab
+    "if (!scope) return null;"  # No tab, no answer
+    "const pagination = scope.querySelector('agt-pagination');"  # The pagination bar
+    "const rawTotal = (pagination && pagination.getAttribute('data-total-results')) || scope.getAttribute('data-no-of-results');"  # The total is stored in one of two attributes
+    "const total = parseInt(rawTotal, 10);"  # Turn the text into a number
+    "return Number.isNaN(total) ? null : total;"  # Give back null when there is no number
+    "}"  # End of the function
+)  # End of the script
+READ_SDS_NO_RESULTS_SCRIPT = (  # JavaScript that tells whether the results tab says that nothing was found
+    "(scopeSelector) => {"  # The argument is the CSS selector of the results tab
+    "const scope = document.querySelector(scopeSelector);"  # Find the results tab
+    "if (!scope) return false;"  # No tab, no answer
+    "return /no results|showing 0 results/i.test(scope.innerText || '');"  # True when the visible text says there are no results
     "}"  # End of the function
 )  # End of the script
 
@@ -2109,13 +2188,12 @@ def read_sds_cards(
 def get_us_english_urls_from_cards(
     card_descriptions: list,
 ) -> set:  # Keep only the cards tagged "English - United States"
-    us_english_urls = {
+    return {
         card_description["href"]
         for card_description in card_descriptions
         if US_ENGLISH_LABEL in card_description["labels"]
         and urlparse(card_description["href"]).path.lower().endswith(".pdf")
     }  # Only real PDF links with the right language tag
-    return us_english_urls  # Give the addresses back
 
 
 def wait_for_sds_cards_to_appear(
@@ -2133,106 +2211,233 @@ def wait_for_sds_cards_to_appear(
     return False  # No cards appeared in time
 
 
-def wait_for_sds_cards_to_change(
-    browser_page: Page, previous_links: tuple
-) -> bool:  # Wait until the page shows different cards than before
-    wait_deadline = (
-        time.time() + SDS_PAGE_CHANGE_TIMEOUT_SECONDS
-    )  # The moment when we give up
+def wait_for_sds_total_results(
+    browser_page: Page, timeout_seconds: float
+) -> Optional[int]:  # Wait until the page tells how many results the query has
+    wait_deadline = time.time() + timeout_seconds  # The moment when we give up
     while time.time() < wait_deadline:  # Keep checking until the time is up
         try:  # Reading can fail while the page is changing
-            current_links = tuple(
-                card_description["href"]
-                for card_description in read_sds_cards(browser_page)
-            )  # The addresses now on the page
-            if (
-                current_links and current_links != previous_links
-            ):  # New cards are showing
-                time.sleep(1)  # Let the page finish drawing
-                return True  # The page changed
+            total_results = browser_page.evaluate(
+                READ_SDS_TOTAL_SCRIPT, SDS_RESULTS_SCOPE_SELECTOR
+            )  # Ask the page for the total
+            if total_results is not None:  # The page knows the total
+                return int(total_results)  # Done
         except PlaywrightError as browser_error:  # The read did not work
             if is_browser_closed_error(browser_error):  # The browser itself is gone
                 raise  # Let the restart logic deal with it
         time.sleep(0.5)  # Wait a moment and look again
-    return False  # The cards never changed
-
-
-def click_next_sds_page(
-    browser_page: Page,
-) -> bool:  # Click the "next" button of the safety data sheet results
-    next_button = browser_page.locator(
-        SDS_NEXT_BUTTON_SELECTOR
-    ).first  # The first matching "next" button inside the right tab
-    try:  # The button may be missing or disabled
-        if next_button.count() == 0:  # There is no such button
-            download_logger.info("[SDS page] no next button found")  # Record it
-            return False  # Nothing to click
-        if (
-            next_button.is_disabled()
-            or next_button.get_attribute("aria-disabled") == "true"
-            or next_button.get_attribute("disabled") is not None
-        ):  # The button is switched off, which means this is the last page
-            download_logger.info(
-                "[SDS page] the next button is disabled, last page reached"
-            )  # Record it
-            return False  # Nothing to click
-        click_element_like_a_human(
-            browser_page, next_button
-        )  # Move the pointer to the button like a person and click it
-        download_logger.info("[SDS page] clicked the next button")  # Record the click
-        return True  # We asked for the next page
-    except PlaywrightError as browser_error:  # The click did not work
+    try:  # The total never appeared; look at what the page shows instead
+        if read_sds_cards(
+            browser_page
+        ):  # There are cards, so the query has results but no readable total
+            download_logger.warning(
+                "[SDS page] the total is not readable, assuming the maximum reachable number of results"
+            )  # Say so
+            return SDS_MAXIMUM_REACHABLE_RESULTS  # Walk until the cards run out
+        if browser_page.evaluate(
+            READ_SDS_NO_RESULTS_SCRIPT, SDS_RESULTS_SCOPE_SELECTOR
+        ):  # The page says that nothing was found
+            return 0  # No results
+    except PlaywrightError as browser_error:  # The read did not work
         if is_browser_closed_error(browser_error):  # The browser itself is gone
             raise  # Let the restart logic deal with it
+    return None  # We cannot tell
+
+
+def format_date_clause(
+    range_start: Optional[date], range_end: Optional[date]
+) -> list:  # The query parts that limit the publication date
+    if range_start is None or range_end is None:  # No date limit
+        return []  # Nothing to add
+    return [
+        f"@{SDS_DATE_FIELD}>={range_start.strftime('%Y/%m/%d')}",
+        f"@{SDS_DATE_FIELD}<={range_end.strftime('%Y/%m/%d')}",
+    ]  # Both ends of the date range, inclusive
+
+
+def build_sds_page_url(
+    use_locale_clause: bool,
+    range_start: Optional[date],
+    range_end: Optional[date],
+    first_result: int,
+) -> str:  # Build the address of one result page, in the same style as the addresses of the site
+    query_parts = [SDS_OBJECT_TYPE_CLAUSE]  # Always select safety data sheets
+    if use_locale_clause:  # Ask for US English documents only
+        query_parts.append(SDS_LOCALE_CLAUSE)  # Add the locale query part
+    query_parts.extend(
+        format_date_clause(range_start, range_end)
+    )  # Add the date range, if any
+    address_parameters = [
+        ("cq", " AND ".join(query_parts)),
+        ("searchAttempt", "modified"),
+        (SDS_LANGUAGE_FACET_PARAMETER, SDS_LANGUAGE_FACET_VALUE),
+    ]  # The same parameters as in the addresses you gave me
+    if first_result > 0:  # Page 1 has no first-result parameter
+        address_parameters.append(
+            (SDS_FIRST_RESULT_PARAMETER, str(first_result))
+        )  # Select the page
+    return (
+        SDS_BASE_URL + "?" + urlencode(address_parameters)
+    )  # Join everything into one address
+
+
+def build_sds_segment_key(
+    use_locale_clause: bool, range_start: Optional[date], range_end: Optional[date]
+) -> str:  # A short name that identifies one query piece in the database
+    mode_name = (
+        "us" if use_locale_clause else "en"
+    )  # US English query or plain English query
+    start_text = (
+        range_start.isoformat() if range_start else "all"
+    )  # Start of the date range
+    end_text = range_end.isoformat() if range_end else "all"  # End of the date range
+    return f"{mode_name}|{start_text}|{end_text}"  # The key
+
+
+def split_date_range(
+    range_start: Optional[date], range_end: Optional[date]
+) -> Optional[
+    tuple
+]:  # Cut a date range into two halves; returns None when it cannot be cut any more
+    if range_start is None or range_end is None:  # The segment has no date limit yet
+        range_start, range_end = (
+            SDS_EARLIEST_DATE,
+            SDS_LATEST_DATE,
+        )  # Start from the whole date range
+    if range_start >= range_end:  # A single day cannot be cut
+        return None  # No split possible
+    middle_date = (
+        range_start + (range_end - range_start) // 2
+    )  # The day that ends the first half
+    return (
+        (range_start, middle_date),
+        (middle_date + timedelta(days=1), range_end),
+    )  # The two halves
+
+
+def probe_sds_segment_total(
+    browser_session: "BrowserSession",
+    download_database: DownloadDatabase,
+    run_statistics: RunStatistics,
+    use_locale_clause: bool,
+    range_start: Optional[date],
+    range_end: Optional[date],
+) -> Optional[
+    int
+]:  # Find out how many results a segment has; returns None when the page could not be read
+    segment_key = build_sds_segment_key(
+        use_locale_clause, range_start, range_end
+    )  # The database key of the segment
+    saved_state = download_database.load_sds_segment(
+        segment_key
+    )  # Maybe we know it already
+    if saved_state is not None:  # The total was saved earlier
+        return saved_state[0]  # No request needed
+    results_page = (
+        browser_session.active_results_page
+    )  # The tab used for browsing the results
+    browser_session.close_unneeded_tabs()  # Only the results tab may be open
+    browser_session.internet_monitor.raise_error_if_internet_is_down()  # Wait for the internet before opening the page
+    page_url = build_sds_page_url(
+        use_locale_clause, range_start, range_end, 0
+    )  # The first page of the segment
+    page_status = open_page_politely(
+        results_page, page_url, run_statistics
+    )  # Open it, backing off if blocked
+    if (
+        page_status == PAGE_STATUS_FAILED
+        and browser_session.internet_monitor.confirm_internet_is_down()
+    ):  # The page failed because the internet is down
+        raise InternetOutageError(
+            "The internet went down while counting the results"
+        )  # Wait for it, then retry
+    if page_status != PAGE_STATUS_OPENED:  # The page did not open normally
         download_logger.warning(
-            "[SDS page] clicking next failed (%s), trying the generic next button search",
-            str(browser_error).splitlines()[0],
-        )  # Record the problem
-        return click_next_page_button(
-            browser_page
-        )  # Fall back to the generic search for a next button
+            "[SDS page] could not count the results of segment %s (status: %s)",
+            segment_key,
+            page_status,
+        )  # Record it
+        return None  # We do not know
+    dismiss_cookie_banner(results_page)  # Close the cookie popup if it is present
+    total_results = wait_for_sds_total_results(
+        results_page, SDS_WAIT_FOR_RESULTS_SECONDS
+    )  # Read the total
+    if total_results is None:  # The page did not tell
+        download_logger.warning(
+            "[SDS page] the result count of segment %s could not be read", segment_key
+        )  # Record it
+        return None  # We do not know
+    download_database.save_sds_segment(
+        segment_key, total_results, 0, False
+    )  # Remember it
+    download_logger.info(
+        "[SDS page] segment %s has %d result(s)", segment_key, total_results
+    )  # Record it
+    pause_while_acting_like_a_human(
+        results_page,
+        *PAUSE_SECONDS_RANGE_BETWEEN_RESULT_PAGES,
+        "after counting a segment",
+    )  # Move the mouse and scroll before the next request
+    return total_results  # Give the total back
 
 
-def read_sds_page_position(
-    browser_page: Page,
-) -> str:  # A short text such as "11 - 20 of 200087 results" for the log
-    try:  # The element may be missing
-        return (
-            browser_page.locator(SDS_RESULTS_SCOPE_SELECTOR + " .agt-pagination__info")
-            .first.inner_text(timeout=2000)
-            .strip()
-        )  # Read the pagination info text
-    except PlaywrightError:  # The element could not be read
-        return "position unknown"  # Say so
-
-
-def open_sds_search_page(
-    browser_page: Page, run_statistics: RunStatistics
-) -> bool:  # Open the safety data sheet page; returns True when cards are showing
-    page_urls_to_try = (
-        [SDS_PAGE_FILTERED_URL, SDS_PAGE_PLAIN_URL]
-        if TRY_FILTERED_SDS_URL_FIRST
-        else [SDS_PAGE_PLAIN_URL]
-    )  # The filtered address is tried first, the plain one is the fallback
-    for page_url in page_urls_to_try:  # Try the addresses in order
+def choose_sds_query_mode(
+    browser_session: "BrowserSession", run_statistics: RunStatistics
+) -> Optional[
+    bool
+]:  # Decide whether the US English query works; returns True (US query), False (plain English query) or None (nothing works)
+    results_page = (
+        browser_session.active_results_page
+    )  # The tab used for browsing the results
+    modes_to_try = (
+        [True, False] if USE_LOCALE_CLAUSE else [False]
+    )  # The US query is tried first
+    for use_locale_clause in modes_to_try:  # Try each mode
+        browser_session.internet_monitor.raise_error_if_internet_is_down()  # Wait for the internet before opening the page
+        page_url = build_sds_page_url(
+            use_locale_clause, None, None, 0
+        )  # The first page of the whole query
         page_status = open_page_politely(
-            browser_page, page_url, run_statistics
-        )  # Open the page, backing off if blocked
+            results_page, page_url, run_statistics
+        )  # Open it, backing off if blocked
+        if (
+            page_status == PAGE_STATUS_FAILED
+            and browser_session.internet_monitor.confirm_internet_is_down()
+        ):  # The page failed because the internet is down
+            raise InternetOutageError(
+                "The internet went down while opening the SDS page"
+            )  # Wait for it, then retry
         if page_status != PAGE_STATUS_OPENED:  # The page did not open normally
             download_logger.warning(
                 "[SDS page] could not open %s (status: %s)", page_url, page_status
             )  # Record it
-            continue  # Try the next address
-        dismiss_cookie_banner(browser_page)  # Close the cookie popup if it is present
-        if wait_for_sds_cards_to_appear(browser_page, 25):  # Cards are showing
-            download_logger.info(
-                "[SDS page] opened with results: %s", page_url
+            continue  # Try the next mode
+        dismiss_cookie_banner(results_page)  # Close the cookie popup if it is present
+        if not wait_for_sds_cards_to_appear(
+            results_page, SDS_WAIT_FOR_RESULTS_SECONDS
+        ):  # No cards showed up
+            download_logger.warning(
+                "[SDS page] no result cards at %s, trying the next query style",
+                page_url,
+            )  # The site may not understand this query
+            continue  # Try the next mode
+        card_descriptions = read_sds_cards(results_page)  # The cards of the first page
+        if use_locale_clause and not all(
+            US_ENGLISH_LABEL in card_description["labels"]
+            for card_description in card_descriptions
+        ):  # Not every card is US English, so the site ignored the locale part of the query
+            download_logger.warning(
+                "[SDS page] the US English query is not honoured by the site, using the plain English filter instead"
             )  # Record it
-            return True  # Done
-        download_logger.warning(
-            "[SDS page] no result cards showed up at %s", page_url
-        )  # The filtered address may not be understood by the site
-    return False  # Nothing worked
+            continue  # Try the next mode
+        download_logger.info(
+            "[SDS page] query style chosen: %s",
+            "US English query"
+            if use_locale_clause
+            else "plain English filter (cards are filtered by their tag)",
+        )  # Record the decision
+        return use_locale_clause  # This mode works
+    return None  # Nothing worked
 
 
 def download_us_english_urls(
@@ -2290,95 +2495,290 @@ def download_us_english_urls(
     return True  # Requests were made
 
 
-def download_all_us_english_sds(
+def walk_sds_segment(
     browser_session: "BrowserSession",
     download_database: DownloadDatabase,
     run_statistics: RunStatistics,
-) -> None:  # Walk through every result page and download the "English - United States" documents
+    use_locale_clause: bool,
+    range_start: Optional[date],
+    range_end: Optional[date],
+    total_results: int,
+    first_result: int,
+) -> bool:  # Open the pages of one segment one by one and download the US English cards; returns True when the segment is finished
+    segment_key = build_sds_segment_key(
+        use_locale_clause, range_start, range_end
+    )  # The database key of the segment
     results_page = (
         browser_session.active_results_page
     )  # The tab used for browsing the results
-    browser_session.close_unneeded_tabs()  # Start with only the results tab open
-    browser_session.internet_monitor.raise_error_if_internet_is_down()  # Wait for the internet before opening the page
-    download_logger.info(
-        "Job 2: US English documents from %s", SDS_PAGE_PLAIN_URL
-    )  # Record what we are about to do
-    if not open_sds_search_page(
-        results_page, run_statistics
-    ):  # Open the page and wait for cards
-        if (
-            browser_session.internet_monitor.confirm_internet_is_down()
-        ):  # The internet is the reason
-            raise InternetOutageError(
-                "The internet went down while opening the SDS page"
-            )  # Wait for it, then retry
-        download_logger.error(
-            "[SDS page] could not open the page with results, giving up on job 2"
-        )  # Record it
-        return  # Nothing more to do
-    pause_while_acting_like_a_human(
-        results_page,
-        *ACTIVITY_SECONDS_RANGE_AFTER_OPENING_SEARCH_PAGE,
-        "after opening the SDS page",
-    )  # Move the mouse and scroll before reading the results
-
-    total_us_english_links_seen = 0  # Running count of US English links found
-    for page_number in range(
-        1, MAXIMUM_SDS_RESULT_PAGES + 1
-    ):  # Walk through the result pages
+    reachable_results = min(
+        total_results, SDS_MAXIMUM_REACHABLE_RESULTS
+    )  # The site shows at most 5,000 results
+    previous_page_links: Optional[
+        tuple
+    ] = None  # The cards of the previous page, to notice a page that does not change
+    while first_result < reachable_results:  # One page per round
         browser_session.close_unneeded_tabs()  # Close any tab other than the results and download tabs
         browser_session.internet_monitor.raise_error_if_internet_is_down()  # Stop here and wait if the internet is down
         results_page.bring_to_front()  # Keep the results tab in front
+        page_url = build_sds_page_url(
+            use_locale_clause, range_start, range_end, first_result
+        )  # The address of this page
+        page_status = open_page_politely(
+            results_page, page_url, run_statistics
+        )  # Open it, backing off if blocked
+        if (
+            page_status == PAGE_STATUS_FAILED
+            and browser_session.internet_monitor.confirm_internet_is_down()
+        ):  # The page failed because the internet is down
+            raise InternetOutageError(
+                "The internet went down while opening a result page"
+            )  # Wait for it, then retry
+        if page_status != PAGE_STATUS_OPENED:  # The page did not open normally
+            download_logger.warning(
+                "[SDS page] segment %s: could not open the page at result %d (status: %s); it will be continued next run",
+                segment_key,
+                first_result,
+                page_status,
+            )  # Record it
+            return False  # The segment stays unfinished
+        dismiss_cookie_banner(results_page)  # Close the cookie popup if it is present
+        if not wait_for_sds_cards_to_appear(
+            results_page, SDS_WAIT_FOR_RESULTS_SECONDS
+        ):  # No cards showed up
+            download_logger.warning(
+                "[SDS page] segment %s: no cards at result %d; it will be continued next run",
+                segment_key,
+                first_result,
+            )  # Record it
+            return False  # The segment stays unfinished
 
         card_descriptions = read_sds_cards(results_page)  # Read every card on this page
-        all_links_on_page = tuple(
+        page_links = tuple(
             card_description["href"] for card_description in card_descriptions
-        )  # Every address on the page, used to notice when the page changes
+        )  # Every address on the page
+        if (
+            page_links == previous_page_links
+        ):  # The site shows the same page again, so it ignores the page number
+            download_logger.warning(
+                "[SDS page] segment %s: result %d shows the same cards as the previous page, stopping this segment",
+                segment_key,
+                first_result,
+            )  # Record it
+            break  # Stop here, otherwise this would repeat forever
+        previous_page_links = page_links  # Remember this page for the next comparison
         us_english_urls = get_us_english_urls_from_cards(
             card_descriptions
         )  # Keep the US English ones
-        total_us_english_links_seen += len(us_english_urls)  # Add them to the total
         download_logger.info(
-            "[SDS page] page %d (%s): %d card(s), %d US English, %d US English in total",
-            page_number,
-            read_sds_page_position(results_page),
+            "[SDS page] segment %s: page %d of %d: %d card(s), %d US English",
+            segment_key,
+            first_result // SDS_RESULTS_PER_PAGE + 1,
+            (reachable_results + SDS_RESULTS_PER_PAGE - 1) // SDS_RESULTS_PER_PAGE,
             len(card_descriptions),
             len(us_english_urls),
-            total_us_english_links_seen,
         )  # Show progress
-
         if us_english_urls:  # Only download when this page has something
             download_us_english_urls(
                 browser_session, download_database, us_english_urls, run_statistics
             )  # Download the US English documents of this page
 
-        pause_while_acting_like_a_human(
-            results_page,
-            *PAUSE_SECONDS_RANGE_BETWEEN_RESULT_PAGES,
-            "before the next result page",
-        )  # Move the mouse and scroll instead of sitting still
-        results_page.bring_to_front()  # Return to the results tab before looking for the next page button
-        if not click_next_sds_page(results_page):  # Try to go to the next page
-            download_logger.info("[SDS page] there is no further page")  # Record it
-            break  # The last page was reached
-        if not wait_for_sds_cards_to_change(
-            results_page, all_links_on_page
-        ):  # Wait until the next page's cards are showing
-            download_logger.warning(
-                "[SDS page] the cards did not change after clicking next, stopping"
-            )  # Explain why we stop
-            break  # Stop, because paging does not work any more
-        if not is_results_page_usable(
-            results_page, run_statistics
-        ):  # Check for the error page or "Access Denied"
-            download_logger.warning(
-                "[SDS page] the next result page is not usable, stopping"
-            )  # Explain the stop
-            break  # Stop here
+        first_result += SDS_RESULTS_PER_PAGE  # The next page starts here
+        download_database.save_sds_segment(
+            segment_key, total_results, first_result, False
+        )  # Save the position, so a stopped run continues here
+        if first_result < reachable_results:  # Another page follows
+            pause_while_acting_like_a_human(
+                results_page,
+                *PAUSE_SECONDS_RANGE_BETWEEN_RESULT_PAGES,
+                "before the next result page",
+            )  # Move the mouse and scroll instead of sitting still
 
+    download_database.save_sds_segment(
+        segment_key, total_results, first_result, True
+    )  # The segment is finished
+    download_logger.info("[SDS page] segment %s finished", segment_key)  # Record it
+    return True  # Done
+
+
+def process_sds_segment(
+    browser_session: "BrowserSession",
+    download_database: DownloadDatabase,
+    run_statistics: RunStatistics,
+    use_locale_clause: bool,
+    range_start: Optional[date],
+    range_end: Optional[date],
+    known_total: Optional[int] = None,
+) -> bool:  # Handle one segment: split it if it is too big, otherwise walk its pages; returns True when it is finished
+    segment_key = build_sds_segment_key(
+        use_locale_clause, range_start, range_end
+    )  # The database key of the segment
+    saved_state = download_database.load_sds_segment(
+        segment_key
+    )  # What we know from earlier
+    if saved_state is not None and saved_state[2]:  # Already finished in an earlier run
+        download_logger.info(
+            "[SDS page] segment %s was finished earlier, skipping", segment_key
+        )  # Record it
+        return True  # Nothing to do
+    total_results = (
+        known_total
+        if known_total is not None
+        else probe_sds_segment_total(
+            browser_session,
+            download_database,
+            run_statistics,
+            use_locale_clause,
+            range_start,
+            range_end,
+        )
+    )  # How many results the segment has
+    if total_results is None:  # We could not find out
+        return False  # The segment stays unfinished
+    if total_results == 0:  # Nothing in this segment
+        download_database.save_sds_segment(segment_key, 0, 0, True)  # Finished
+        return True  # Done
+
+    if (
+        total_results > SDS_MAXIMUM_REACHABLE_RESULTS
+    ):  # Too many results to reach with page numbers alone
+        halves = split_date_range(range_start, range_end)  # Cut the date range in two
+        if halves is not None:  # The range can be cut
+            (first_start, first_end), (
+                second_start,
+                second_end,
+            ) = halves  # The two halves
+            first_total = probe_sds_segment_total(
+                browser_session,
+                download_database,
+                run_statistics,
+                use_locale_clause,
+                first_start,
+                first_end,
+            )  # Count the first half
+            second_total = probe_sds_segment_total(
+                browser_session,
+                download_database,
+                run_statistics,
+                use_locale_clause,
+                second_start,
+                second_end,
+            )  # Count the second half
+            if first_total is None or second_total is None:  # A count failed
+                return False  # Try again next run
+            combined_total = (
+                first_total + second_total
+            )  # What the two halves hold together
+            if (
+                combined_total > total_results or combined_total == 0
+            ):  # Impossible numbers: the site ignores the date part of the query
+                download_logger.warning(
+                    "[SDS page] segment %s: the date filter does not seem to work (%d + %d vs %d); only the first %d results of it can be reached",
+                    segment_key,
+                    first_total,
+                    second_total,
+                    total_results,
+                    SDS_MAXIMUM_REACHABLE_RESULTS,
+                )  # Warn the user
+            else:  # The date filter works
+                download_logger.info(
+                    "[SDS page] segment %s has %d results, splitting it into %s..%s (%d) and %s..%s (%d)",
+                    segment_key,
+                    total_results,
+                    first_start,
+                    first_end,
+                    first_total,
+                    second_start,
+                    second_end,
+                    second_total,
+                )  # Explain the split
+                first_finished = process_sds_segment(
+                    browser_session,
+                    download_database,
+                    run_statistics,
+                    use_locale_clause,
+                    first_start,
+                    first_end,
+                    first_total,
+                )  # Handle the first half
+                second_finished = process_sds_segment(
+                    browser_session,
+                    download_database,
+                    run_statistics,
+                    use_locale_clause,
+                    second_start,
+                    second_end,
+                    second_total,
+                )  # Handle the second half
+                if first_finished and second_finished:  # Both halves are finished
+                    download_database.save_sds_segment(
+                        segment_key, total_results, 0, True
+                    )  # So is the parent
+                return first_finished and second_finished  # Report the result
+        else:  # A single day with more than 5,000 results
+            download_logger.warning(
+                "[SDS page] segment %s cannot be cut any more; only the first %d results of it can be reached",
+                segment_key,
+                SDS_MAXIMUM_REACHABLE_RESULTS,
+            )  # Warn the user
+
+    saved_state = download_database.load_sds_segment(
+        segment_key
+    )  # Read again, the probe may have just saved it
+    first_result = (
+        saved_state[1] if saved_state is not None else 0
+    )  # Continue where an earlier run stopped
+    return walk_sds_segment(
+        browser_session,
+        download_database,
+        run_statistics,
+        use_locale_clause,
+        range_start,
+        range_end,
+        total_results,
+        first_result,
+    )  # Walk the pages of this segment
+
+
+def download_all_us_english_sds(
+    browser_session: "BrowserSession",
+    download_database: DownloadDatabase,
+    run_statistics: RunStatistics,
+) -> None:  # Job 2: download the "English - United States" documents of the whole safety data sheet page
+    browser_session.close_unneeded_tabs()  # Start with only the results tab open
+    browser_session.internet_monitor.raise_error_if_internet_is_down()  # Wait for the internet before opening the page
     download_logger.info(
-        "[SDS page] finished; %d US English link(s) seen", total_us_english_links_seen
-    )  # Summarise the job
+        "Job 2: US English documents from %s", SDS_BASE_URL
+    )  # Record what we are about to do
+    use_locale_clause = choose_sds_query_mode(
+        browser_session, run_statistics
+    )  # Find out which query style works
+    if use_locale_clause is None:  # Nothing worked
+        download_logger.error(
+            "[SDS page] could not open the page with results, giving up on job 2"
+        )  # Record it
+        return  # Nothing more to do
+    pause_while_acting_like_a_human(
+        browser_session.active_results_page,
+        *ACTIVITY_SECONDS_RANGE_AFTER_OPENING_SEARCH_PAGE,
+        "after opening the SDS page",
+    )  # Move the mouse and scroll before reading the results
+    all_segments_finished = process_sds_segment(
+        browser_session,
+        download_database,
+        run_statistics,
+        use_locale_clause,
+        None,
+        None,
+    )  # Handle the whole query; it splits itself when it is too big
+    if all_segments_finished:  # Everything is done
+        download_logger.info(
+            "[SDS page] job 2 finished: every segment is complete"
+        )  # Record it
+    else:  # Something is left
+        download_logger.warning(
+            "[SDS page] job 2 is not complete: some pages could not be read; run the script again to continue"
+        )  # Tell the user
     browser_session.close_unneeded_tabs()  # The job is done, so close anything that is not needed
 
 
