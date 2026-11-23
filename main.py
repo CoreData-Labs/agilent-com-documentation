@@ -25,9 +25,9 @@
 #     a direct request that reuses the browser's cookies.
 #
 # How to start (the job order never changes: Chemical Standards first, then Safety Data Sheets):
-#   python agilent_downloader.py                                   -> Chemical Standards, then Safety Data Sheets
-#   python agilent_downloader.py --start-from chemical-standards   -> the same as above
-#   python agilent_downloader.py --start-from safety-data-sheets   -> skips Chemical Standards, runs Safety Data Sheets only
+#   python main.py                                   -> Chemical Standards, then Safety Data Sheets
+#   python main.py --start-from chemical-standards   -> the same as above
+#   python main.py --start-from safety-data-sheets   -> skips Chemical Standards, runs Safety Data Sheets only
 #
 # The browser is controlled through invisible_playwright (Playwright on an anti-detect Firefox).
 #
