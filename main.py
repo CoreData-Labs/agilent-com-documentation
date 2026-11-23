@@ -19,6 +19,7 @@
 #   * The site only lets you reach 5,000 results (500 pages), so the query asks for US English documents only
 #     and, if that is still more than 5,000, the publication-date range is split in halves until every piece fits.
 #   * Progress is saved in the database, so a stopped run continues at the page where it stopped.
+#   * The PDF links are read from the JavaScript-rendered DOM of the real browser (not from the page source).
 #   * Clicking a PDF link opens the PDF in the browser (https://www.agilent.com/library/msds/<name>.pdf).
 #     The script saves that PDF from the page it opened; if that does not work it falls back to
 #     a direct request that reuses the browser's cookies.
@@ -1798,7 +1799,9 @@ def search_one_keyword_and_download_pdfs(
 
 # ============================================================== SAFETY DATA SHEETS (US ENGLISH)
 #
-# The page https://www.agilent.com/en/search/safety-data-sheets shows 10 cards per page. Every card has
+# The page https://www.agilent.com/en/search/safety-data-sheets shows 10 cards per page. The cards and their PDF links
+# are NOT in the page source: JavaScript builds them after the page opens, so they are read from the rendered DOM
+# (what Inspect Element shows) with page.evaluate(), never from view-source or the raw HTML response. Every card has
 #   <a class="pub-ext" href="/library/msds/5190-8406_US.pdf">  and tags such as  <span class="meta-text">English - United States</span>
 # Clicking the link opens the PDF at https://www.agilent.com/library/msds/<name>.pdf.
 #
@@ -1816,14 +1819,20 @@ US_ENGLISH_LABEL = (
     "English - United States"  # The language tag on the cards that is wanted
 )
 
-READ_SDS_CARDS_SCRIPT = (
+READ_SDS_CARDS_SCRIPT = (  # Runs inside the page, on the live DOM after JavaScript has rendered it (not on the page source)
     "(scopeSelector) => {"
     "const scope = document.querySelector(scopeSelector);"
     "if (!scope) return [];"
     "return Array.from(scope.querySelectorAll('.compendiumcard')).map(card => {"
-    "const link = card.querySelector('a.pub-ext') || card.querySelector('a[href]');"
+    "const link = card.querySelector('a.pub-ext') || card.querySelector('a[href*=\\'.pdf\\' i]') || card.querySelector('a[href]');"
     "const labels = Array.from(card.querySelectorAll('.meta-text')).map(tag => tag.innerText.trim());"
-    "return {href: link ? link.href : null, labels: labels};"
+    "let locale = null; let dataUri = null;"
+    "const holder = card.closest('[data-result]');"
+    "if (holder) { try { const result = JSON.parse(holder.getAttribute('data-result')); const raw = result.raw || {};"
+    " locale = raw.locale || null; dataUri = raw.clickableuri || result.printableUri || result.PrintableUri || null; } catch (e) {} }"
+    "let href = link ? link.href : null;"  # link.href is the full address that the browser resolved from the rendered link
+    "if (!href && dataUri) { try { href = new URL(dataUri, location.origin).href; } catch (e) {} }"
+    "return {href: href, labels: labels, locale: locale};"
     "});"
     "}"
 )
@@ -1854,8 +1863,13 @@ def normalize_label(
 
 def card_is_us_english(
     card_description: dict,
-) -> bool:  # True when any tag on the card says English + United States
-    for label_text in card_description.get("labels", []):
+) -> bool:  # True when the card says English + United States
+    texts_to_check = list(card_description.get("labels", []))
+    if card_description.get(
+        "locale"
+    ):  # For example "English_UNITED STATES", read from the rendered card
+        texts_to_check.append(card_description["locale"])
+    for label_text in texts_to_check:
         normalized_label = normalize_label(label_text)
         if "english" in normalized_label and "united states" in normalized_label:
             return True
@@ -1895,16 +1909,62 @@ def get_us_english_urls_from_cards(
 
 
 def wait_for_sds_cards_to_appear(browser_page: Page, timeout_seconds: float) -> bool:
+    """Wait until JavaScript has rendered the result cards and their PDF links in the live DOM.
+
+    The PDF links are not in the page source: the site builds the cards with JavaScript after the page opens.
+    So this waits for the cards to exist in the rendered DOM, waits until the number of cards stops changing,
+    and scrolls the page so that anything loaded lazily is rendered too. Only then are the cards read.
+    """
     wait_deadline = time.time() + timeout_seconds
-    while time.time() < wait_deadline:
+    try:  # Step 1: wait for the first rendered card to appear in the DOM
+        browser_page.wait_for_selector(
+            f"{SDS_RESULTS_SCOPE_SELECTOR} .compendiumcard",
+            state="attached",
+            timeout=int(timeout_seconds * 1000),
+        )
+    except PlaywrightTimeoutError:
+        pass  # The polling loop below makes the final decision
+    except PlaywrightError as browser_error:
+        if is_browser_closed_error(browser_error):
+            raise
+    previous_card_count = -1
+    stable_rounds = 0
+    scrolled_once = False
+    while (
+        time.time() < wait_deadline
+    ):  # Step 2: wait until the rendered cards have links and stop changing
         try:
-            if read_sds_cards(browser_page):
-                return True
+            rendered_cards = read_sds_cards(browser_page)
+            if rendered_cards:
+                if (
+                    not scrolled_once
+                ):  # Step 3: scroll once so lazily rendered content appears
+                    scroll_to_bottom_of_page(browser_page, pause_seconds=0.4)
+                    browser_page.evaluate("window.scrollTo(0, 0)")
+                    scrolled_once = True
+                    previous_card_count = -1
+                    stable_rounds = 0
+                    continue
+                if len(rendered_cards) == previous_card_count:
+                    stable_rounds += 1
+                    if (
+                        stable_rounds >= 2
+                    ):  # The number of rendered cards did not change for two checks
+                        download_logger.debug(
+                            "[SDS page] rendered DOM ready: %d card(s) with a PDF link",
+                            len(rendered_cards),
+                        )
+                        return True
+                else:
+                    previous_card_count = len(rendered_cards)
+                    stable_rounds = 0
         except PlaywrightError as browser_error:
             if is_browser_closed_error(browser_error):
                 raise
-        time.sleep(0.5)
-    return False
+        time.sleep(0.7)
+    return bool(
+        scrolled_once
+    )  # Cards were seen at some point, even if the count kept changing
 
 
 def wait_for_sds_total_results(
