@@ -15,7 +15,8 @@
 #   Downloads every "English - United States" document from
 #   https://www.agilent.com/en/search/safety-data-sheets
 #   (the file names there look like 5190-8406_US.pdf or 18711-60060_NAEnglish.pdf).
-#   * Every result page is opened directly by its address (c_ds_firstResult=0, 10, 20, ...).
+#   * The page is opened once (page 1); then the page numbers 1, 2, 3 ... up to 500 are CLICKED one at a time.
+#     Every page's rendered DOM is read, every .pdf link in it is collected, and the PDFs are downloaded.
 #   * The site only lets you reach 5,000 results (500 pages), so the query asks for US English documents only
 #     and, if that is still more than 5,000, the publication-date range is split in halves until every piece fits.
 #   * Progress is saved in the database, so a stopped run continues at the page where it stopped.
@@ -147,6 +148,8 @@ SDS_RESULTS_SCOPE_SELECTOR = (
 )
 SDS_EARLIEST_DATE = date(1990, 1, 1)  # The date range that is split starts here
 SDS_LATEST_DATE = date(2027, 12, 31)  # The date range that is split ends here
+SDS_DOWNLOAD_ONLY_US_ENGLISH = True  # True: only cards tagged "English - United States"; False: every PDF found on every page
+SDS_SEGMENT_KEY_VERSION = "pages-v2"  # Changing this makes old saved Safety Data Sheets progress (for example a wrongly "finished" run) be ignored
 SDS_WAIT_FOR_RESULTS_SECONDS = (
     25  # How long to wait for a result page to show its cards or its total
 )
@@ -1892,6 +1895,14 @@ def read_sds_cards(
 def get_us_english_urls_from_cards(
     card_descriptions: list,
 ) -> set:  # Keep only the cards tagged "English - United States"
+    if (
+        not SDS_DOWNLOAD_ONLY_US_ENGLISH
+    ):  # Every PDF link found in the rendered DOM of the page
+        return {
+            card_description["href"]
+            for card_description in card_descriptions
+            if ".pdf" in urlparse(card_description["href"]).path.lower()
+        }
     us_english_urls = {
         card_description["href"]
         for card_description in card_descriptions
@@ -2033,7 +2044,7 @@ def build_sds_segment_key(
     mode_name = "us" if use_locale_clause else "en"
     start_text = range_start.isoformat() if range_start else "all"
     end_text = range_end.isoformat() if range_end else "all"
-    return f"{mode_name}|{start_text}|{end_text}"
+    return f"{SDS_SEGMENT_KEY_VERSION}|{mode_name}|{start_text}|{end_text}"
 
 
 def split_date_range(
@@ -2200,6 +2211,238 @@ def download_us_english_urls(
     return True
 
 
+# ---- Page navigation by clicking the page numbers (1, 2, 3 ... 500) in the rendered pagination bar
+
+SDS_PAGINATION_SELECTOR = f"{SDS_RESULTS_SCOPE_SELECTOR} agt-pagination"  # The pagination bar of the safety data sheet tab
+READ_SDS_PAGINATION_SCRIPT = r"""(scopeSelector) => {
+  const pagination = document.querySelector(scopeSelector + ' agt-pagination');
+  if (!pagination) return null;
+  const activeButton = pagination.querySelector('.agt-pagination__item--active button[data-page]');
+  const info = pagination.querySelector('.agt-pagination__info');
+  let fromInfo = null;
+  if (info) {
+    const match = (info.innerText || '').match(/^\s*([\d,]+)\s*-/);
+    if (match) fromInfo = Math.floor((parseInt(match[1].replace(/,/g, ''), 10) - 1) / 10) + 1;
+  }
+  const fromActive = activeButton ? parseInt(activeButton.getAttribute('data-page'), 10) : null;
+  const fromAttribute = parseInt(pagination.getAttribute('data-current-page'), 10);
+  return {info: fromInfo, active: fromActive, attribute: Number.isNaN(fromAttribute) ? null : fromAttribute};
+}"""  # Runs in the live DOM: tells which page number the pagination bar shows right now
+
+
+def read_current_sds_page_number(browser_page: Page) -> Optional[int]:
+    """The page number the rendered pagination bar shows now (from the '11 - 20 of ...' text, the active button, or its attribute)."""
+    try:
+        pagination_state = browser_page.evaluate(
+            READ_SDS_PAGINATION_SCRIPT, SDS_RESULTS_SCOPE_SELECTOR
+        )
+    except PlaywrightError as browser_error:
+        if is_browser_closed_error(browser_error):
+            raise
+        return None
+    if not pagination_state:
+        return None
+    for state_key in ("info", "active", "attribute"):
+        if pagination_state.get(state_key):
+            return int(pagination_state[state_key])
+    return None
+
+
+def click_first_visible_match(
+    browser_page: Page, matching_locator
+) -> bool:  # Click the first visible element of a locator like a person
+    try:
+        match_count = matching_locator.count()
+    except PlaywrightError as browser_error:
+        if is_browser_closed_error(browser_error):
+            raise
+        return False
+    for match_position in range(match_count):
+        candidate_element = matching_locator.nth(match_position)
+        try:
+            if not candidate_element.is_visible():
+                continue
+            click_element_like_a_human(browser_page, candidate_element)
+            return True
+        except (PlaywrightError, PlaywrightTimeoutError) as browser_error:
+            if is_browser_closed_error(browser_error):
+                raise
+            continue
+    return False
+
+
+def click_sds_page_number_button(
+    browser_page: Page, target_page: int
+) -> bool:  # Click the number "target_page" in the pagination bar
+    return click_first_visible_match(
+        browser_page,
+        browser_page.locator(
+            f"{SDS_PAGINATION_SELECTOR} button.agt-pagination__btn[data-page='{target_page}']"
+        ),
+    )
+
+
+def click_sds_next_button(
+    browser_page: Page,
+) -> bool:  # Click the ">" button (only used when the number is not shown in the bar)
+    return click_first_visible_match(
+        browser_page,
+        browser_page.locator(
+            f"{SDS_PAGINATION_SELECTOR} button[data-action='next']:not([disabled])"
+        ),
+    )
+
+
+def click_sds_page_through_ellipsis_menu(browser_page: Page, target_page: int) -> bool:
+    """Page numbers that the bar hides behind '...' are reached by opening the '...' menu and clicking the number in it."""
+    ellipsis_buttons = browser_page.locator(
+        f"{SDS_PAGINATION_SELECTOR} button.agt-pagination__ellipsis-btn"
+    )
+    try:
+        ellipsis_count = ellipsis_buttons.count()
+    except PlaywrightError as browser_error:
+        if is_browser_closed_error(browser_error):
+            raise
+        return False
+    for ellipsis_position in range(ellipsis_count):
+        ellipsis_button = ellipsis_buttons.nth(ellipsis_position)
+        try:
+            if not ellipsis_button.is_visible():
+                continue
+            click_element_like_a_human(browser_page, ellipsis_button)
+            time.sleep(0.6)
+            menu_item_locator = browser_page.locator(
+                f"button.agt-pagination__menu-item[data-page='{target_page}']"
+            )
+            if click_first_visible_match(browser_page, menu_item_locator):
+                return True
+            browser_page.keyboard.press(
+                "Escape"
+            )  # This menu does not hold the number; close it and try the next '...'
+        except (PlaywrightError, PlaywrightTimeoutError) as browser_error:
+            if is_browser_closed_error(browser_error):
+                raise
+            continue
+    return False
+
+
+def wait_until_sds_page_is(
+    browser_page: Page,
+    target_page: int,
+    previous_page_links: Optional[tuple],
+    timeout_seconds: float,
+) -> bool:
+    """After a click: wait until the bar shows the target page AND the rendered cards are different from the previous page."""
+    wait_deadline = time.time() + timeout_seconds
+    while time.time() < wait_deadline:
+        try:
+            current_page = read_current_sds_page_number(browser_page)
+            current_links = tuple(
+                card_description["href"]
+                for card_description in read_sds_cards(browser_page)
+            )
+        except PlaywrightError as browser_error:
+            if is_browser_closed_error(browser_error):
+                raise
+            time.sleep(0.5)
+            continue
+        page_number_matches = (
+            current_page == target_page if current_page is not None else True
+        )
+        if (
+            page_number_matches
+            and current_links
+            and current_links != previous_page_links
+        ):
+            return wait_for_sds_cards_to_appear(
+                browser_page, SDS_WAIT_FOR_RESULTS_SECONDS
+            )  # Let the new cards finish rendering
+        time.sleep(0.5)
+    return False
+
+
+def go_to_sds_page_number(
+    browser_session: "BrowserSession",
+    target_page: int,
+    previous_page_links: Optional[tuple],
+) -> bool:
+    """Go to one specific page by clicking its number: the number itself, else '>' for the next page, else the '...' menu."""
+    results_page = browser_session.active_results_page
+    for attempt_number in range(1, 4):
+        browser_session.internet_monitor.raise_error_if_internet_is_down()
+        current_page = read_current_sds_page_number(results_page)
+        if current_page == target_page:
+            return True
+        if click_sds_page_number_button(results_page, target_page):
+            click_method = "page number"
+        elif (
+            current_page is not None
+            and target_page == current_page + 1
+            and click_sds_next_button(results_page)
+        ):
+            click_method = "next button"
+        elif click_sds_page_through_ellipsis_menu(results_page, target_page):
+            click_method = "'...' menu"
+        else:
+            download_logger.warning(
+                "[SDS page] could not find a way to click page %d (attempt %d/3)",
+                target_page,
+                attempt_number,
+            )
+            time.sleep(2)
+            continue
+        download_logger.info(
+            "[SDS page] clicked page %d (%s), waiting for it to render",
+            target_page,
+            click_method,
+        )
+        if wait_until_sds_page_is(results_page, target_page, previous_page_links, 20):
+            return True
+        download_logger.warning(
+            "[SDS page] page %d did not show after the click (attempt %d/3)",
+            target_page,
+            attempt_number,
+        )
+    return False
+
+
+def open_sds_result_page_by_address(
+    browser_session: "BrowserSession",
+    run_statistics: RunStatistics,
+    use_locale_clause: bool,
+    range_start: Optional[date],
+    range_end: Optional[date],
+    first_result: int,
+) -> Optional[tuple]:
+    """Open a result page by its address in the real browser; returns the links of its rendered cards, or None."""
+    results_page = browser_session.active_results_page
+    page_url = build_sds_page_url(
+        use_locale_clause, range_start, range_end, first_result
+    )
+    page_status = open_page_politely(results_page, page_url, run_statistics)
+    if (
+        page_status == PAGE_STATUS_FAILED
+        and browser_session.internet_monitor.confirm_internet_is_down()
+    ):
+        raise InternetOutageError("The internet went down while opening a result page")
+    if page_status != PAGE_STATUS_OPENED:
+        download_logger.warning(
+            "[SDS page] could not open the page at result %d (status: %s)",
+            first_result,
+            page_status,
+        )
+        return None
+    dismiss_cookie_banner(results_page)
+    if not wait_for_sds_cards_to_appear(results_page, SDS_WAIT_FOR_RESULTS_SECONDS):
+        download_logger.warning(
+            "[SDS page] no rendered cards at result %d", first_result
+        )
+        return None
+    return tuple(
+        card_description["href"] for card_description in read_sds_cards(results_page)
+    )
+
+
 def walk_sds_segment(
     browser_session: "BrowserSession",
     download_database: DownloadDatabase,
@@ -2209,81 +2452,116 @@ def walk_sds_segment(
     range_end: Optional[date],
     total_results: int,
     first_result: int,
-) -> bool:  # Open the pages of one segment one by one and download the US English cards; True when finished
+) -> bool:
+    """Open the page once, then go through its pages ONE AT A TIME by clicking the page numbers (page 1, 2, 3 ... up to 500).
+
+    On every page the rendered DOM is read (what Inspect Element shows), every PDF link found there is collected,
+    and the PDFs are downloaded before the next page number is clicked. Returns True when the segment is finished.
+    """
     segment_key = build_sds_segment_key(use_locale_clause, range_start, range_end)
     results_page = browser_session.active_results_page
     reachable_results = min(total_results, SDS_MAXIMUM_REACHABLE_RESULTS)
-    previous_page_links: Optional[tuple] = None  # To notice a page that does not change
-    while first_result < reachable_results:
+    total_pages = (reachable_results + SDS_RESULTS_PER_PAGE - 1) // SDS_RESULTS_PER_PAGE
+    page_number = (
+        first_result // SDS_RESULTS_PER_PAGE + 1
+    )  # A stopped run continues at the page where it stopped
+
+    browser_session.close_unneeded_tabs()
+    browser_session.internet_monitor.raise_error_if_internet_is_down()
+    current_page_links = open_sds_result_page_by_address(
+        browser_session, run_statistics, use_locale_clause, range_start, range_end, 0
+    )  # Page 1 is opened once by its address; every other page is reached by clicking
+    if current_page_links is None:
+        download_logger.warning(
+            "[SDS page] segment %s: could not open the first page; it will be continued next run",
+            segment_key,
+        )
+        return False
+    if page_number > 1:  # Continue where the last run stopped
+        download_logger.info(
+            "[SDS page] segment %s: continuing at page %d", segment_key, page_number
+        )
+        if not go_to_sds_page_number(browser_session, page_number, current_page_links):
+            current_page_links = open_sds_result_page_by_address(
+                browser_session,
+                run_statistics,
+                use_locale_clause,
+                range_start,
+                range_end,
+                (page_number - 1) * SDS_RESULTS_PER_PAGE,
+            )
+            if current_page_links is None:
+                return False
+
+    while page_number <= total_pages:
         browser_session.close_unneeded_tabs()
         browser_session.internet_monitor.raise_error_if_internet_is_down()
         results_page.bring_to_front()
-        page_url = build_sds_page_url(
-            use_locale_clause, range_start, range_end, first_result
-        )
-        page_status = open_page_politely(results_page, page_url, run_statistics)
-        if (
-            page_status == PAGE_STATUS_FAILED
-            and browser_session.internet_monitor.confirm_internet_is_down()
-        ):
-            raise InternetOutageError(
-                "The internet went down while opening a result page"
-            )
-        if page_status != PAGE_STATUS_OPENED:
-            download_logger.warning(
-                "[SDS page] segment %s: could not open the page at result %d (status: %s); it will be continued next run",
-                segment_key,
-                first_result,
-                page_status,
-            )
-            return False
-        dismiss_cookie_banner(results_page)
-        if not wait_for_sds_cards_to_appear(results_page, SDS_WAIT_FOR_RESULTS_SECONDS):
-            download_logger.warning(
-                "[SDS page] segment %s: no cards at result %d; it will be continued next run",
-                segment_key,
-                first_result,
-            )
-            return False
 
-        card_descriptions = read_sds_cards(results_page)
-        page_links = tuple(
+        card_descriptions = read_sds_cards(
+            results_page
+        )  # The fully rendered DOM of this page
+        current_page_links = tuple(
             card_description["href"] for card_description in card_descriptions
         )
-        if page_links == previous_page_links:
+        pdf_urls = get_us_english_urls_from_cards(card_descriptions)
+        download_logger.info(
+            "[SDS page] segment %s: page %d of %d: %d card(s), %d PDF(s) to download",
+            segment_key,
+            page_number,
+            total_pages,
+            len(card_descriptions),
+            len(pdf_urls),
+        )
+        if pdf_urls:
+            download_us_english_urls(
+                browser_session, download_database, pdf_urls, run_statistics
+            )
+
+        page_number += 1
+        download_database.save_sds_segment(
+            segment_key, total_results, (page_number - 1) * SDS_RESULTS_PER_PAGE, False
+        )  # Save the position, so a stopped run continues at the next page
+        if page_number > total_pages:
+            break
+        pause_while_acting_like_a_human(
+            results_page,
+            *PAUSE_SECONDS_RANGE_BETWEEN_RESULT_PAGES,
+            "before clicking the next page number",
+        )
+        results_page.bring_to_front()
+        if go_to_sds_page_number(browser_session, page_number, current_page_links):
+            continue
+        download_logger.warning(
+            "[SDS page] clicking page %d failed, opening it by its address instead",
+            page_number,
+        )
+        new_page_links = open_sds_result_page_by_address(
+            browser_session,
+            run_statistics,
+            use_locale_clause,
+            range_start,
+            range_end,
+            (page_number - 1) * SDS_RESULTS_PER_PAGE,
+        )
+        if new_page_links is None:
             download_logger.warning(
-                "[SDS page] segment %s: result %d shows the same cards as the previous page, stopping this segment",
+                "[SDS page] segment %s: page %d could not be opened; it will be continued next run",
                 segment_key,
-                first_result,
+                page_number,
+            )
+            return False
+        if new_page_links == current_page_links:
+            download_logger.warning(
+                "[SDS page] segment %s: page %d shows the same cards as the page before, stopping this segment",
+                segment_key,
+                page_number,
             )
             break
-        previous_page_links = page_links
-        us_english_urls = get_us_english_urls_from_cards(card_descriptions)
-        download_logger.info(
-            "[SDS page] segment %s: page %d of %d: %d card(s), %d US English",
-            segment_key,
-            first_result // SDS_RESULTS_PER_PAGE + 1,
-            (reachable_results + SDS_RESULTS_PER_PAGE - 1) // SDS_RESULTS_PER_PAGE,
-            len(card_descriptions),
-            len(us_english_urls),
-        )
-        if us_english_urls:
-            download_us_english_urls(
-                browser_session, download_database, us_english_urls, run_statistics
-            )
 
-        first_result += SDS_RESULTS_PER_PAGE
-        download_database.save_sds_segment(
-            segment_key, total_results, first_result, False
-        )
-        if first_result < reachable_results:
-            pause_while_acting_like_a_human(
-                results_page,
-                *PAUSE_SECONDS_RANGE_BETWEEN_RESULT_PAGES,
-                "before the next result page",
-            )
-
-    download_database.save_sds_segment(segment_key, total_results, first_result, True)
+    download_database.save_sds_segment(
+        segment_key, total_results, (page_number - 1) * SDS_RESULTS_PER_PAGE, True
+    )
     download_logger.info("[SDS page] segment %s finished", segment_key)
     return True
 
