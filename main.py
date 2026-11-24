@@ -2273,24 +2273,29 @@ def click_first_visible_match(
 
 def click_sds_page_number_button(
     browser_page: Page, target_page: int
-) -> bool:  # Click the number "target_page" in the pagination bar
+) -> bool:  # Click only the exact numbered button for "target_page"
+    exact_number_locator = browser_page.locator(  # Locate candidate page buttons matching data-page
+        f"{SDS_PAGINATION_SELECTOR} button.agt-pagination__btn[data-page='{target_page}']"  # Selector scoped to the target page number
+    ).filter(
+        has_text=re.compile(rf"^\s*{target_page}\s*$")
+    )  # Ensure the button text is strictly the target page number and not a multi-page control
     return click_first_visible_match(
-        browser_page,
-        browser_page.locator(
-            f"{SDS_PAGINATION_SELECTOR} button.agt-pagination__btn[data-page='{target_page}']"
-        ),
-    )
+        browser_page, exact_number_locator
+    )  # Click the first visible matching page button
 
 
 def click_sds_next_button(
     browser_page: Page,
-) -> bool:  # Click the ">" button (only used when the number is not shown in the bar)
+) -> bool:  # Click the single-step ">" next-page button without skipping multiple pages
+    single_next_locator = browser_page.locator(  # Locate enabled next-page controls
+        f"{SDS_PAGINATION_SELECTOR} button[data-action='next']:not([disabled]), "  # Match pagination buttons with action="next"
+        f"{SDS_PAGINATION_SELECTOR} button[aria-label*='next page' i]:not([disabled])"  # Also match accessible "next page" buttons
+    ).filter(
+        has_not_text=re.compile(r">>|»")
+    )  # Exclude double-arrow controls that skip ahead by multiple pages
     return click_first_visible_match(
-        browser_page,
-        browser_page.locator(
-            f"{SDS_PAGINATION_SELECTOR} button[data-action='next']:not([disabled])"
-        ),
-    )
+        browser_page, single_next_locator
+    )  # Click the first visible single-step next button
 
 
 def click_sds_page_through_ellipsis_menu(browser_page: Page, target_page: int) -> bool:
@@ -2361,49 +2366,65 @@ def wait_until_sds_page_is(
     return False
 
 
-def go_to_sds_page_number(
+def go_to_sds_page_number(  # Navigate to target_page sequentially without skipping pages
     browser_session: "BrowserSession",
     target_page: int,
-    previous_page_links: Optional[tuple],
-) -> bool:
-    """Go to one specific page by clicking its number: the number itself, else '>' for the next page, else the '...' menu."""
-    results_page = browser_session.active_results_page
-    for attempt_number in range(1, 4):
-        browser_session.internet_monitor.raise_error_if_internet_is_down()
-        current_page = read_current_sds_page_number(results_page)
-        if current_page == target_page:
-            return True
-        if click_sds_page_number_button(results_page, target_page):
-            click_method = "page number"
+    previous_page_links: Optional[
+        tuple
+    ],  # Session, destination page, and prior card links
+) -> bool:  # Return True once target_page finishes rendering
+    """Go to one specific page by clicking its number: the number itself, else '>' for the next page, else the '...' menu."""  # Docstring describing fallback order
+    results_page = (
+        browser_session.active_results_page
+    )  # Active tab displaying Safety Data Sheets results
+    for attempt_number in range(
+        1, 4
+    ):  # Retry up to 3 times if navigation does not settle
+        browser_session.internet_monitor.raise_error_if_internet_is_down()  # Abort immediately if internet connectivity is lost
+        current_page = read_current_sds_page_number(
+            results_page
+        )  # Read the page number currently shown in the pagination bar
+        if current_page == target_page:  # Already on the requested page
+            return True  # No click needed
+        if click_sds_page_number_button(
+            results_page, target_page
+        ):  # Try clicking the exact page number button first
+            click_method = f"page number {target_page}"  # Record that an exact page number button was clicked
         elif (
-            current_page is not None
-            and target_page == current_page + 1
-            and click_sds_next_button(results_page)
-        ):
-            click_method = "next button"
-        elif click_sds_page_through_ellipsis_menu(results_page, target_page):
-            click_method = "'...' menu"
-        else:
+            current_page is None or target_page == current_page + 1
+        ) and click_sds_next_button(
+            results_page
+        ):  # Step forward by 1 page when moving from current_page to current_page + 1
+            click_method = (
+                "next button (>)"  # Record that the single-step next button was clicked
+            )
+        elif click_sds_page_through_ellipsis_menu(
+            results_page, target_page
+        ):  # Fall back to opening '...' when target_page is hidden
+            click_method = "'...' menu"  # Record that the ellipsis menu was used
+        else:  # No usable pagination control was found on this attempt
             download_logger.warning(
                 "[SDS page] could not find a way to click page %d (attempt %d/3)",
                 target_page,
                 attempt_number,
-            )
-            time.sleep(2)
-            continue
+            )  # Log the missing control
+            time.sleep(2)  # Wait briefly before retrying
+            continue  # Try the next attempt
         download_logger.info(
             "[SDS page] clicked page %d (%s), waiting for it to render",
             target_page,
             click_method,
-        )
-        if wait_until_sds_page_is(results_page, target_page, previous_page_links, 20):
-            return True
+        )  # Log the click action taken
+        if wait_until_sds_page_is(
+            results_page, target_page, previous_page_links, 20
+        ):  # Wait until both page number and rendered cards update
+            return True  # Target page rendered successfully
         download_logger.warning(
             "[SDS page] page %d did not show after the click (attempt %d/3)",
             target_page,
             attempt_number,
-        )
-    return False
+        )  # Log that the page did not change in time
+    return False  # Return False after exhausting all retry attempts
 
 
 def open_sds_result_page_by_address(
